@@ -152,3 +152,17 @@ openspec
 coverage.html
 coverage.out
 .specify
+
+# Added by maintenance script
+node_modules/
+venv/
+.venv/
+.abw/
+bin/
+logs/
+__pycache__/
+target/
+.pytest_cache/
+dist/
+build/
+*.log
