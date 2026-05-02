@@ -1,6 +1,6 @@
 module github.com/tbxark/mcp-proxy
 
-go 1.24.0
+go 1.26.2
 
 require (
 	github.com/go-sphere/confstore v0.0.4
