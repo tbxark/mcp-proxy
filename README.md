@@ -28,6 +28,8 @@ make build
 
 ### Install via Go
 
+Requires Go 1.24+.
+
 ```bash
 go install github.com/tbxark/mcp-proxy@latest
 ```
