@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -37,6 +38,9 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 		mcpClient, err := client.NewStdioMCPClient(v.Command, envs, v.Args...)
 		if err != nil {
 			return nil, err
+		}
+		if stdioTransport, ok := mcpClient.GetTransport().(*transport.Stdio); ok {
+			go io.Copy(io.Discard, stdioTransport.Stderr())
 		}
 
 		return &Client{
