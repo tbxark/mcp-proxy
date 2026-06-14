@@ -67,6 +67,13 @@ type OptionsV2 struct {
 	AuthTokens     []string             `json:"authTokens,omitempty"`
 	ToolFilter     *ToolFilterConfig    `json:"toolFilter,omitempty"`
 	Disabled       bool                 `json:"disabled,omitempty"`
+	// AutoReconnect (default true) keeps retrying a backend that is unreachable
+	// at startup and re-establishes one that drops later, instead of leaving the
+	// route permanently broken. Set to false to restore fail-once behaviour.
+	AutoReconnect optional.Field[bool] `json:"autoReconnect"`
+	// ReconnectInterval is the gap between connection attempts while a backend is
+	// unreachable at startup. Defaults to 15s when unset.
+	ReconnectInterval time.Duration `json:"reconnectInterval,omitempty"`
 }
 
 type MCPProxyConfigV2 struct {
@@ -213,6 +220,12 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 		}
 		if !clientConfig.Options.LogEnabled.Present() {
 			clientConfig.Options.LogEnabled = conf.McpProxy.Options.LogEnabled
+		}
+		if !clientConfig.Options.AutoReconnect.Present() {
+			clientConfig.Options.AutoReconnect = conf.McpProxy.Options.AutoReconnect
+		}
+		if clientConfig.Options.ReconnectInterval <= 0 {
+			clientConfig.Options.ReconnectInterval = conf.McpProxy.Options.ReconnectInterval
 		}
 	}
 

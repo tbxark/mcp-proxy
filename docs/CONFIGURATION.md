@@ -86,9 +86,12 @@ Common fields:
   - `mode`: `allow` or `block`.
   - `list`: List of tool names.
 - `Disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
+- `autoReconnect` (bool, default `true`): Keep retrying a backend that is unreachable at startup, and re-establish one that drops later (detected via the ping task). The HTTP route is registered immediately regardless, so the endpoint never 404s just because the backend was down at the time the proxy started. Set to `false` to restore the previous fail-once behaviour. Ignored when `panicIfInvalid` is true.
+- `reconnectInterval` (duration in ns, default `15s`): Gap between connection attempts while a backend is unreachable at startup.
 
 Notes:
 
 - `mcpProxy.options.authTokens` serves as the default token set if a server omits `options.authTokens`.
+- `mcpProxy.options.autoReconnect` / `reconnectInterval` serve as defaults for servers that omit them.
 - To discover tool names for filtering, start without a filter and check logs for lines like `<server> Adding tool <name>`.
 
