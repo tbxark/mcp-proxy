@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -73,6 +74,37 @@ func recoverMiddleware(prefix string) MiddlewareFunc {
 	}
 }
 
+// healthHandler returns an unauthenticated handler for liveness/readiness
+// probes. It responds to GET with a small JSON status document and to HEAD with
+// an empty 200 body, so it can be used by Docker, reverse proxies, and
+// monitoring without speaking MCP or providing the proxy auth token.
+func healthHandler(config *Config) http.HandlerFunc {
+	type healthResponse struct {
+		Name        string `json:"name"`
+		ServerCount int    `json:"serverCount"`
+		Status      string `json:"status"`
+		Version     string `json:"version"`
+	}
+	body := healthResponse{
+		Name:        config.McpProxy.Name,
+		ServerCount: len(config.McpServers),
+		Status:      "ok",
+		Version:     config.McpProxy.Version,
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(body)
+		case http.MethodHead:
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
 func startHTTPServer(config *Config) error {
 	baseURL, uErr := url.Parse(config.McpProxy.BaseURL)
 	if uErr != nil {
@@ -91,6 +123,11 @@ func startHTTPServer(config *Config) error {
 	info := mcp.Implementation{
 		Name: config.McpProxy.Name,
 	}
+
+	// Unauthenticated health endpoints for liveness/readiness probes.
+	health := healthHandler(config)
+	httpMux.HandleFunc("/_healthz", health)
+	httpMux.HandleFunc("/_readyz", health)
 
 	for name, clientConfig := range config.McpServers {
 		if clientConfig.Options.Disabled {
