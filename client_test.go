@@ -22,6 +22,34 @@ func TestMCPServerListResourcesReturnsEmptyArrayNotNull(t *testing.T) {
 		t.Fatalf("newMCPServer: %v", err)
 	}
 
+	assertEmptyJSONArray := func(t *testing.T, raw []byte, field, want string) {
+		t.Helper()
+
+		var decoded struct {
+			Error *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+			Result map[string]json.RawMessage `json:"result"`
+		}
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("unmarshal response: %v\npayload: %s", err, string(raw))
+		}
+		if decoded.Error != nil {
+			t.Fatalf("unexpected JSON-RPC error (code %d): %s\nfull response: %s",
+				decoded.Error.Code, decoded.Error.Message, string(raw))
+		}
+
+		got, ok := decoded.Result[field]
+		if !ok {
+			t.Fatalf("response missing result.%s\nfull response: %s", field, string(raw))
+		}
+		if string(got) != want {
+			t.Fatalf("expected result.%s to be %s, got %s\nfull response: %s",
+				field, want, string(got), string(raw))
+		}
+	}
+
 	t.Run("resources/list", func(t *testing.T) {
 		resp := server.mcpServer.HandleMessage(context.Background(), []byte(`{
 			"jsonrpc": "2.0",
@@ -34,18 +62,7 @@ func TestMCPServerListResourcesReturnsEmptyArrayNotNull(t *testing.T) {
 		if err != nil {
 			t.Fatalf("marshal response: %v", err)
 		}
-
-		var decoded struct {
-			Result struct {
-				Resources json.RawMessage `json:"resources"`
-			} `json:"result"`
-		}
-		if err := json.Unmarshal(raw, &decoded); err != nil {
-			t.Fatalf("unmarshal response: %v\npayload: %s", err, string(raw))
-		}
-		if string(decoded.Result.Resources) != "[]" {
-			t.Fatalf("expected resources to be [], got %s", string(decoded.Result.Resources))
-		}
+		assertEmptyJSONArray(t, raw, "resources", "[]")
 	})
 
 	t.Run("resources/templates/list", func(t *testing.T) {
@@ -60,17 +77,6 @@ func TestMCPServerListResourcesReturnsEmptyArrayNotNull(t *testing.T) {
 		if err != nil {
 			t.Fatalf("marshal response: %v", err)
 		}
-
-		var decoded struct {
-			Result struct {
-				ResourceTemplates json.RawMessage `json:"resourceTemplates"`
-			} `json:"result"`
-		}
-		if err := json.Unmarshal(raw, &decoded); err != nil {
-			t.Fatalf("unmarshal response: %v\npayload: %s", err, string(raw))
-		}
-		if string(decoded.Result.ResourceTemplates) != "[]" {
-			t.Fatalf("expected resourceTemplates to be [], got %s", string(decoded.Result.ResourceTemplates))
-		}
+		assertEmptyJSONArray(t, raw, "resourceTemplates", "[]")
 	})
 }
