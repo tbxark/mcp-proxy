@@ -144,39 +144,52 @@ func (c *Client) startPingTask(ctx context.Context) {
 	}
 }
 
-func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServer) error {
-	toolsRequest := mcp.ListToolsRequest{}
+func buildToolFilterFunc(clientName string, options *OptionsV2) func(toolName string) bool {
 	filterFunc := func(toolName string) bool {
 		return true
 	}
-
-	if c.options != nil && c.options.ToolFilter != nil && len(c.options.ToolFilter.List) > 0 {
-		filterSet := make(map[string]struct{})
-		mode := ToolFilterMode(strings.ToLower(string(c.options.ToolFilter.Mode)))
-		for _, toolName := range c.options.ToolFilter.List {
-			filterSet[toolName] = struct{}{}
-		}
-		switch mode {
-		case ToolFilterModeAllow:
-			filterFunc = func(toolName string) bool {
-				_, inList := filterSet[toolName]
-				if !inList {
-					log.Printf("<%s> Ignoring tool %s as it is not in allow list", c.name, toolName)
-				}
-				return inList
-			}
-		case ToolFilterModeBlock:
-			filterFunc = func(toolName string) bool {
-				_, inList := filterSet[toolName]
-				if inList {
-					log.Printf("<%s> Ignoring tool %s as it is in block list", c.name, toolName)
-				}
-				return !inList
-			}
-		default:
-			log.Printf("<%s> Unknown tool filter mode: %s, skipping tool filter", c.name, mode)
-		}
+	if options == nil || options.ToolFilter == nil {
+		return filterFunc
 	}
+
+	filterList := normalizeToolFilterList(options.ToolFilter.List)
+	if len(filterList) == 0 {
+		return filterFunc
+	}
+
+	filterSet := make(map[string]struct{}, len(filterList))
+	mode := ToolFilterMode(strings.ToLower(string(options.ToolFilter.Mode)))
+	for _, toolName := range filterList {
+		filterSet[toolName] = struct{}{}
+	}
+	log.Printf("<%s> Applying toolFilter mode=%s for tools: %s", clientName, mode, strings.Join(filterList, ", "))
+
+	switch mode {
+	case ToolFilterModeAllow:
+		return func(toolName string) bool {
+			_, inList := filterSet[toolName]
+			if !inList {
+				log.Printf("<%s> Ignoring tool %s as it is not in allow list", clientName, toolName)
+			}
+			return inList
+		}
+	case ToolFilterModeBlock:
+		return func(toolName string) bool {
+			_, inList := filterSet[toolName]
+			if inList {
+				log.Printf("<%s> Ignoring tool %s as it is in block list", clientName, toolName)
+			}
+			return !inList
+		}
+	default:
+		log.Printf("<%s> Unknown tool filter mode: %s, skipping tool filter", clientName, mode)
+		return filterFunc
+	}
+}
+
+func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServer) error {
+	toolsRequest := mcp.ListToolsRequest{}
+	filterFunc := buildToolFilterFunc(c.name, c.options)
 
 	for {
 		tools, err := c.client.ListTools(ctx, toolsRequest)

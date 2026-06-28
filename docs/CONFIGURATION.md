@@ -84,7 +84,7 @@ Common fields:
 - `authTokens` ([]string): Valid bearer tokens; requests must include `Authorization: <token>`.
 - `toolFilter` (object): Selectively expose tools to the proxy:
   - `mode`: `allow` or `block`.
-  - `list`: List of tool names.
+  - `list`: Tool names as a JSON array, or a single comma-separated string (useful when values are injected via environment-variable expansion).
 - `Disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
 
 Notes:
