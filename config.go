@@ -2,7 +2,9 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"fmt"
 	nethttp "net/http"
 	"strings"
 	"time"
@@ -59,6 +61,59 @@ const (
 type ToolFilterConfig struct {
 	Mode ToolFilterMode `json:"mode,omitempty"`
 	List []string       `json:"list,omitempty"`
+}
+
+// UnmarshalJSON accepts toolFilter.list as either a JSON array or a
+// comma-separated string. The latter is common when list values are injected
+// via environment-variable expansion (e.g. ENABLED_TOOLS="a,b,c").
+func (c *ToolFilterConfig) UnmarshalJSON(data []byte) error {
+	aux := struct {
+		Mode string          `json:"mode,omitempty"`
+		List json.RawMessage `json:"list,omitempty"`
+	}{}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	c.Mode = ToolFilterMode(strings.TrimSpace(string(aux.Mode)))
+	if len(aux.List) == 0 {
+		return nil
+	}
+	var list []string
+	if err := json.Unmarshal(aux.List, &list); err == nil {
+		c.List = list
+		return nil
+	}
+	var single string
+	if err := json.Unmarshal(aux.List, &single); err == nil {
+		c.List = []string{single}
+		return nil
+	}
+	return fmt.Errorf("toolFilter.list must be a string or array of strings")
+}
+
+// normalizeToolFilterList trims entries and expands comma-separated values so
+// env-expanded lists like ["a,b,c"] match individual tool names.
+func normalizeToolFilterList(list []string) []string {
+	seen := make(map[string]struct{}, len(list))
+	normalized := make([]string, 0, len(list))
+	for _, entry := range list {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		for part := range strings.SplitSeq(entry, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if _, exists := seen[part]; exists {
+				continue
+			}
+			seen[part] = struct{}{}
+			normalized = append(normalized, part)
+		}
+	}
+	return normalized
 }
 
 type OptionsV2 struct {
