@@ -14,6 +14,7 @@ func main() {
 	expandEnv := flag.Bool("expand-env", true, "expand environment variables in config file")
 	httpHeaders := flag.String("http-headers", "", "optional HTTP headers for config URL, format: 'Key1:Value1;Key2:Value2'")
 	httpTimeout := flag.Int("http-timeout", 10, "HTTP timeout in seconds when fetching config from URL")
+	checkConfig := flag.Bool("check-config", false, "load and validate the config, then exit without starting the server")
 
 	version := flag.Bool("version", false, "print version and exit")
 	help := flag.Bool("help", false, "print help and exit")
@@ -29,6 +30,10 @@ func main() {
 	config, err := load(*conf, *insecure, *expandEnv, *httpHeaders, *httpTimeout)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+	if *checkConfig {
+		fmt.Printf("Config OK: %d MCP server(s) configured\n", len(config.McpServers))
+		return
 	}
 	err = startHTTPServer(config)
 	if err != nil {
