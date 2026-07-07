@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"golang.org/x/sync/errgroup"
 )
 
 type MiddlewareFunc func(http.Handler) http.Handler
@@ -114,7 +113,6 @@ func startHTTPServer(config *Config) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var errorGroup errgroup.Group
 	httpMux := http.NewServeMux()
 	httpServer := &http.Server{
 		Addr:    config.McpProxy.Addr,
@@ -142,50 +140,38 @@ func startHTTPServer(config *Config) error {
 		if err != nil {
 			return err
 		}
-		errorGroup.Go(func() error {
-			log.Printf("<%s> Connecting", name)
-			addErr := mcpClient.addToMCPServer(ctx, info, server.mcpServer)
-			if addErr != nil {
-				log.Printf("<%s> Failed to add client to server: %v", name, addErr)
-				if clientConfig.Options.PanicIfInvalid.OrElse(false) {
-					return addErr
-				}
-				return nil
-			}
-			log.Printf("<%s> Connected", name)
 
-			middlewares := make([]MiddlewareFunc, 0)
-			middlewares = append(middlewares, recoverMiddleware(name))
-			if clientConfig.Options.LogEnabled.OrElse(false) {
-				middlewares = append(middlewares, loggerMiddleware(name))
-			}
-			if len(clientConfig.Options.AuthTokens) > 0 {
-				middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
-			}
-			mcpRoute := path.Join(baseURL.Path, name)
-			if !strings.HasPrefix(mcpRoute, "/") {
-				mcpRoute = "/" + mcpRoute
-			}
-			if !strings.HasSuffix(mcpRoute, "/") {
-				mcpRoute += "/"
-			}
-			log.Printf("<%s> Handling requests at %s", name, mcpRoute)
-			httpMux.Handle(mcpRoute, chainMiddleware(server.handler, middlewares...))
-			httpServer.RegisterOnShutdown(func() {
-				log.Printf("<%s> Shutting down", name)
-				_ = mcpClient.Close()
-			})
-			return nil
-		})
-	}
-
-	go func() {
-		err := errorGroup.Wait()
-		if err != nil {
-			log.Fatalf("Failed to add clients: %v", err)
+		// Register the route up-front so the endpoint exists even before the
+		// backend is reachable. The handler resolves the live client lazily, so
+		// tools become available once the connection succeeds and survive
+		// reconnects. This avoids the route never being registered (and the
+		// endpoint 404ing forever) when a backend is down at startup.
+		middlewares := make([]MiddlewareFunc, 0)
+		middlewares = append(middlewares, recoverMiddleware(name))
+		if clientConfig.Options.LogEnabled.OrElse(false) {
+			middlewares = append(middlewares, loggerMiddleware(name))
 		}
-		log.Printf("All clients initialized")
-	}()
+		if len(clientConfig.Options.AuthTokens) > 0 {
+			middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
+		}
+		mcpRoute := path.Join(baseURL.Path, name)
+		if !strings.HasPrefix(mcpRoute, "/") {
+			mcpRoute = "/" + mcpRoute
+		}
+		if !strings.HasSuffix(mcpRoute, "/") {
+			mcpRoute += "/"
+		}
+		log.Printf("<%s> Handling requests at %s", name, mcpRoute)
+		httpMux.Handle(mcpRoute, chainMiddleware(server.handler, middlewares...))
+
+		client := mcpClient
+		httpServer.RegisterOnShutdown(func() {
+			log.Printf("<%s> Shutting down", name)
+			_ = client.Close()
+		})
+
+		go connectWithRetry(ctx, mcpClient, info, server.mcpServer, clientConfig.Options)
+	}
 
 	go func() {
 		log.Printf("Starting %s server", config.McpProxy.Type)
