@@ -1,0 +1,85 @@
+#!/bin/bash
+
+set -e
+
+COVERAGE_FILE=".coverage_baseline"
+THRESHOLD=5.0
+
+echo "========================================"
+echo "  Pre-commit Coverage Check"
+echo "========================================"
+
+go test -coverprofile=coverage.out -covermode=atomic ./... > /dev/null 2>&1
+
+CURRENT_TOTAL=$(go tool cover -func=coverage.out 2>/dev/null | grep "total:" | awk '{print $3}' | sed 's/%//')
+
+if [ -z "$CURRENT_TOTAL" ]; then
+    echo "❌ Failed to calculate coverage"
+    exit 1
+fi
+
+echo ""
+echo "Coverage Breakdown:"
+echo "----------------------------------------"
+go tool cover -func=coverage.out 2>/dev/null | head -20
+echo "..."
+echo "----------------------------------------"
+
+LINES_COVERED=$(go tool cover -func=coverage.out 2>/dev/null | wc -l)
+FUNCTIONS_TOTAL=$(go tool cover -func=coverage.out 2>/dev/null | wc -l)
+
+echo ""
+echo "Summary:"
+echo "  Total Coverage: ${CURRENT_TOTAL}%"
+echo "  Functions/Lines tracked: ${FUNCTIONS_TOTAL}"
+
+if [ ! -f "$COVERAGE_FILE" ]; then
+    echo ""
+    echo "⚠️  No baseline coverage found. Creating baseline at ${CURRENT_TOTAL}%"
+    echo "${CURRENT_TOTAL}" > "$COVERAGE_FILE"
+    echo "✅ Baseline created. Commit allowed."
+    rm -f coverage.out
+    exit 0
+fi
+
+BASELINE=$(cat "$COVERAGE_FILE")
+
+echo "  Baseline Coverage: ${BASELINE}%"
+echo ""
+
+DIFF=$(echo "$CURRENT_TOTAL - $BASELINE" | bc)
+DIFF_ABS=$(echo "$DIFF" | sed 's/-//')
+
+if (( $(echo "$DIFF < 0" | bc -l) )); then
+    DROP=$(echo "$DIFF * -1" | bc)
+    echo "📉 Coverage dropped by ${DROP}%"
+    
+    if (( $(echo "$DROP >= $THRESHOLD" | bc -l) )); then
+        echo ""
+        echo "❌ COMMIT BLOCKED!"
+        echo "   Coverage dropped by ${DROP}% (threshold: ${THRESHOLD}%)"
+        echo ""
+        echo "   Current:  ${CURRENT_TOTAL}%"
+        echo "   Baseline: ${BASELINE}%"
+        echo ""
+        echo "   To fix: Add tests to restore coverage, or update baseline with:"
+        echo "   echo '${CURRENT_TOTAL}' > ${COVERAGE_FILE}"
+        rm -f coverage.out
+        exit 1
+    else
+        echo "⚠️  Coverage drop (${DROP}%) is within threshold (${THRESHOLD}%)"
+        echo "✅ Commit allowed (but consider adding tests)"
+    fi
+else
+    if (( $(echo "$DIFF > 0" | bc -l) )); then
+        echo "📈 Coverage improved by ${DIFF}%"
+        echo "🔄 Updating baseline from ${BASELINE}% to ${CURRENT_TOTAL}%"
+        echo "${CURRENT_TOTAL}" > "$COVERAGE_FILE"
+    else
+        echo "✅ Coverage unchanged at ${CURRENT_TOTAL}%"
+    fi
+    echo "✅ Commit allowed"
+fi
+
+rm -f coverage.out
+exit 0

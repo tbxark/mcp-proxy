@@ -1,0 +1,37 @@
+{
+  "mcpProxy": {
+    "baseURL": "http://127.0.0.1:9091",
+    "addr": ":9091",
+    "name": "MCP Proxy",
+    "version": "1.0.0",
+    "type": "streamable-http",
+    "options": {
+      "panicIfInvalid": false,
+      "logEnabled": true,
+      "authTokens": []
+    }
+  },
+  "mcpServers": {
+    "websearch": {
+      "transportType": "streamable-http",
+      "url": "https://mcp.exa.ai/mcp?tools=web_search_exa",
+      "options": {
+        "authTokens": []
+      }
+    },
+    "context7": {
+      "transportType": "streamable-http",
+      "url": "https://mcp.context7.com/mcp",
+      "options": {
+        "authTokens": []
+      }
+    },
+    "grep_app": {
+      "transportType": "streamable-http",
+      "url": "https://mcp.grep.app",
+      "options": {
+        "authTokens": []
+      }
+    }
+  }
+}

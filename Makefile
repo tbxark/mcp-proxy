@@ -17,6 +17,21 @@ buildLinuxX86:
 buildImage:
 	docker buildx build --platform=linux/amd64,linux/arm64 -t ghcr.io/tbxark/map-proxy:latest . --push --provenance=false
 
+.PHONY: test
+test:
+	go test -v -race ./...
+
+.PHONY: test-cover
+test-cover:
+	go test -v -race -coverprofile=coverage.out ./...
+	go tool cover -func=coverage.out
+
+.PHONY: test-cover-html
+test-cover-html:
+	go test -v -race -coverprofile=coverage.out ./...
+	go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report generated: coverage.html"
+
 .PHONY: format
 format:
 	go fix ./...

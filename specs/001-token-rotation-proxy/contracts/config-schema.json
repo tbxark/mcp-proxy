@@ -1,0 +1,180 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MCP Client Configuration with Token Rotation and Proxy Support",
+  "description": "Configuration schema for MCP client with authentication token rotation and proxy routing",
+  "type": "object",
+  "properties": {
+    "transportType": {
+      "type": "string",
+      "enum": ["stdio", "sse", "streamable-http"],
+      "description": "MCP client transport type"
+    },
+    "command": {
+      "type": "string",
+      "description": "Command to execute (stdio only)"
+    },
+    "args": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Command arguments (stdio only)"
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": {"type": "string"},
+      "description": "Environment variables (stdio only)"
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Server URL (sse and streamable-http only)"
+    },
+    "headers": {
+      "type": "object",
+      "additionalProperties": {"type": "string"},
+      "description": "HTTP headers (sse and streamable-http only)"
+    },
+    "timeout": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Request timeout in milliseconds (streamable-http only)"
+    },
+    "options": {
+      "type": "object",
+      "properties": {
+        "panicIfInvalid": {
+          "type": "boolean",
+          "description": "Panic on invalid configuration"
+        },
+        "logEnabled": {
+          "type": "boolean",
+          "description": "Enable logging for this client"
+        },
+        "authTokens": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "LEGACY: Authentication tokens (use auth.tokens instead)"
+        },
+        "auth": {
+          "type": "object",
+          "properties": {
+            "tokens": {
+              "type": "array",
+              "items": {"type": "string"},
+              "minItems": 1,
+              "description": "List of authentication tokens"
+            },
+            "rotationMode": {
+              "type": "string",
+              "enum": ["round-robin", "on-first-failed"],
+              "description": "Token rotation strategy"
+            },
+            "maxRetries": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum retry attempts (default: number of tokens)"
+            }
+          },
+          "required": ["tokens"],
+          "description": "Authentication configuration with token rotation"
+        },
+        "proxy": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^(http|https|socks5)://",
+              "description": "Proxy URL with scheme (http://, https://, socks5://)"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["http", "https", "socks5"],
+              "description": "Proxy type (optional, derived from URL if not specified)"
+            },
+            "auth": {
+              "type": "object",
+              "properties": {
+                "username": {
+                  "type": "string",
+                  "description": "Proxy username"
+                },
+                "password": {
+                  "type": "string",
+                  "description": "Proxy password"
+                }
+              },
+              "required": ["username", "password"],
+              "description": "Proxy authentication credentials"
+            },
+            "useEnv": {
+              "type": "boolean",
+              "description": "Fall back to HTTP_PROXY/HTTPS_PROXY environment variables (default: true)"
+            }
+          },
+          "required": ["url"],
+          "description": "Proxy configuration for routing client connections"
+        },
+        "toolFilter": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["allow", "block"]
+            },
+            "list": {
+              "type": "array",
+              "items": {"type": "string"}
+            }
+          },
+          "description": "Tool filtering configuration"
+        },
+        "disabled": {
+          "type": "boolean",
+          "description": "Disable this client"
+        }
+      },
+      "description": "Client options"
+    }
+  },
+  "required": ["transportType"],
+  "examples": [
+    {
+      "transportType": "sse",
+      "url": "https://mcp.example.com/sse",
+      "options": {
+        "auth": {
+          "tokens": ["tok_a", "tok_b", "tok_c"],
+          "rotationMode": "round-robin"
+        }
+      }
+    },
+    {
+      "transportType": "streamable-http",
+      "url": "https://mcp.example.com/api",
+      "options": {
+        "auth": {
+          "tokens": ["tok_primary", "tok_backup"],
+          "rotationMode": "on-first-failed",
+          "maxRetries": 2
+        },
+        "proxy": {
+          "url": "http://proxy.internal:8080",
+          "auth": {
+            "username": "proxyuser",
+            "password": "proxypass"
+          }
+        }
+      }
+    },
+    {
+      "transportType": "sse",
+      "url": "https://mcp.example.com/sse",
+      "options": {
+        "proxy": {
+          "url": "socks5://127.0.0.1:1080",
+          "useEnv": true
+        }
+      }
+    }
+  ]
+}

@@ -1,5 +1,9 @@
 # MCP Proxy Server
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/tbxark/mcp-proxy)](https://goreportcard.com/report/github.com/tbxark/mcp-proxy)
+[![Go Coverage](https://img.shields.io/badge/coverage-76.5%25-brightgreen)](coverage_badge.go)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 An MCP proxy that aggregates multiple MCP servers behind a single HTTP entrypoint.
 
 ## Features

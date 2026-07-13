@@ -144,3 +144,11 @@ fabric.properties
 /build
 /dist
 config_prod.json
+projects
+.codex/skills
+.opencode
+openspec
+
+coverage.html
+coverage.out
+.specify
