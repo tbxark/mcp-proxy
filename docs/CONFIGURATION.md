@@ -121,6 +121,14 @@ automatically using the stored refresh token as they expire. Before the
 daemon can use an `oauth`-configured server, you must authorize it once —
 see the `-authorize` flag in [USAGE.md](USAGE.md).
 
+When `clientId` is left empty, the dynamically-registered client (RFC
+7591) is also persisted, to `<user config dir>/mcp-proxy/oauth/<server>.client.json`.
+This matters: registration only happens inside the one-off `-authorize`
+process, so without persisting it, a freshly started daemon would build a
+new OAuth handler with an empty client ID and every token refresh would
+silently be rejected by the provider once the access token expires -
+looking, from the logs, like a refresh failure with no obvious cause.
+
 ## options
 
 - `panicIfInvalid` (bool): If true, startup fails when a client cannot initialize.

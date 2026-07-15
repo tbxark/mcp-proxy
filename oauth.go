@@ -20,6 +20,14 @@ import (
 // transport.OAuthConfig the mcp-go client library expects, backed by a
 // FileTokenStore so tokens survive restarts and are shared between the
 // one-off `-authorize` run and the long-running daemon.
+//
+// If conf has no static ClientID (i.e. dynamic client registration is in
+// play), this loads whatever client was previously registered and
+// persisted by an earlier `-authorize` run. Without this, a freshly
+// started daemon would build an OAuthHandler with an empty ClientID and
+// every token refresh would silently fail (client_id="" gets rejected by
+// the provider) - the one-off authorize process's dynamic registration
+// only ever lived in that process's memory otherwise.
 func buildOAuthConfig(serverName string, conf *OAuthClientConfig) (transport.OAuthConfig, error) {
 	tokenPath, err := oauthTokenPath(serverName)
 	if err != nil {
@@ -29,9 +37,19 @@ func buildOAuthConfig(serverName string, conf *OAuthClientConfig) (transport.OAu
 	if redirectURI == "" {
 		redirectURI = defaultOAuthRedirectURI
 	}
+	clientID, clientSecret := conf.ClientID, conf.ClientSecret
+	if clientID == "" {
+		regClientID, regClientSecret, ok, rErr := loadRegisteredClient(serverName)
+		if rErr != nil {
+			return transport.OAuthConfig{}, rErr
+		}
+		if ok {
+			clientID, clientSecret = regClientID, regClientSecret
+		}
+	}
 	return transport.OAuthConfig{
-		ClientID:              conf.ClientID,
-		ClientSecret:          conf.ClientSecret,
+		ClientID:              clientID,
+		ClientSecret:          clientSecret,
 		RedirectURI:           redirectURI,
 		Scopes:                conf.Scopes,
 		TokenStore:            NewFileTokenStore(tokenPath),
@@ -157,6 +175,9 @@ func authorizeInteractively(ctx context.Context, err error, serverName, redirect
 	if oauthHandler.GetClientID() == "" {
 		if err := oauthHandler.RegisterClient(ctx, "mcp-proxy ("+serverName+")"); err != nil {
 			return fmt.Errorf("failed to register OAuth client: %w", err)
+		}
+		if err := saveRegisteredClient(serverName, oauthHandler.GetClientID(), oauthHandler.GetClientSecret()); err != nil {
+			return fmt.Errorf("failed to persist registered OAuth client: %w", err)
 		}
 	}
 
