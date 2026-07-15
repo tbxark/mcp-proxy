@@ -30,12 +30,13 @@ func buildOAuthConfig(serverName string, conf *OAuthClientConfig) (transport.OAu
 		redirectURI = defaultOAuthRedirectURI
 	}
 	return transport.OAuthConfig{
-		ClientID:     conf.ClientID,
-		ClientSecret: conf.ClientSecret,
-		RedirectURI:  redirectURI,
-		Scopes:       conf.Scopes,
-		TokenStore:   NewFileTokenStore(tokenPath),
-		PKCEEnabled:  !conf.PKCEDisabled,
+		ClientID:              conf.ClientID,
+		ClientSecret:          conf.ClientSecret,
+		RedirectURI:           redirectURI,
+		Scopes:                conf.Scopes,
+		TokenStore:            NewFileTokenStore(tokenPath),
+		PKCEEnabled:           !conf.PKCEDisabled,
+		AuthServerMetadataURL: conf.AuthServerMetadataURL,
 	}, nil
 }
 

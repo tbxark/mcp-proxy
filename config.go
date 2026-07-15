@@ -45,6 +45,16 @@ type OAuthClientConfig struct {
 	RedirectURI  string   `json:"redirectUri,omitempty"`
 	Scopes       []string `json:"scopes,omitempty"`
 	PKCEDisabled bool     `json:"pkceDisabled,omitempty"`
+	// AuthServerMetadataURL overrides discovery of the authorization
+	// server's metadata document. Needed when the server's
+	// authorization_servers entry (RFC 9728) has a non-empty path
+	// component: mcp-go's discovery always appends
+	// "/.well-known/oauth-authorization-server" after the full issuer
+	// URL (OpenID Connect Discovery 1.0 convention), but RFC 8414
+	// requires inserting it before the path when one is present, and
+	// some providers (e.g. Datadog) only serve it at the RFC 8414
+	// location.
+	AuthServerMetadataURL string `json:"authServerMetadataUrl,omitempty"`
 }
 
 const defaultOAuthRedirectURI = "http://localhost:8090/oauth/callback"

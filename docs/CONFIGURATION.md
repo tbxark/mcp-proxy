@@ -102,6 +102,18 @@ as the OAuth client on the downstream connection:
   Must include an explicit port.
 - `scopes` (optional): OAuth scopes to request.
 - `pkceDisabled` (bool, optional): disable PKCE. PKCE is enabled by default.
+- `authServerMetadataUrl` (optional): override discovery of the authorization
+  server's metadata document. Needed for providers whose protected-resource
+  metadata (RFC 9728) advertises an `authorization_servers` entry with a
+  non-empty path (e.g. `https://mcp.example.com/v1/mcp`): this library's
+  discovery always appends `/.well-known/oauth-authorization-server` after
+  the full issuer URL (OpenID Connect Discovery convention), but RFC 8414
+  requires inserting it *before* the path when one is present, and some
+  providers (Datadog, at time of writing) only serve the document at the
+  RFC 8414 location. If servers connected via `oauth` fail discovery,
+  check `<issuer>/.well-known/oauth-authorization-server` vs.
+  `<scheme>://<host>/.well-known/oauth-authorization-server<path>` by hand
+  and set this field to whichever one responds.
 
 Tokens are persisted to `<user config dir>/mcp-proxy/oauth/<server>.json`
 (e.g. `~/.config/mcp-proxy/oauth/notion.json` on Linux) and refreshed
