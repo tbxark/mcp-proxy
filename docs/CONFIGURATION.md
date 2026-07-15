@@ -49,6 +49,15 @@ This project supports a v2 JSON configuration. v1 configs are automatically migr
       "options": {
         "disabled": true
       }
+    },
+    "notion": {
+      // streamable-http client requiring interactive OAuth (no static
+      // bearer token accepted) - see "oauth" below
+      "url": "https://mcp.notion.com/mcp",
+      "transportType": "streamable-http",
+      "oauth": {
+        "scopes": []
+      }
     }
   }
 }
@@ -75,7 +84,30 @@ Common fields:
 - `command`, `args`, `env` — for `stdio` clients.
 - `url`, `headers` — for `sse` and `streamable-http` clients.
 - `timeout` — request timeout for `streamable-http`.
+- `oauth` — for `sse` and `streamable-http` clients that require interactive OAuth instead of (or in addition to) `headers` (see below).
 - `options` — per‑server overrides and filters (see below).
+
+## oauth
+
+Some remote MCP servers (e.g. Notion's hosted MCP) require the full OAuth
+2.1 authorization-code flow and reject static bearer tokens outright. Set
+an `oauth` block on an `sse`/`streamable-http` server to have mcp-proxy act
+as the OAuth client on the downstream connection:
+
+- `clientId`, `clientSecret` (optional): static client credentials. Omit
+  both to use RFC 7591 dynamic client registration, which is performed
+  automatically the first time you authorize.
+- `redirectUri` (optional): local callback URL used during the one-time
+  interactive authorization. Defaults to `http://localhost:8090/oauth/callback`.
+  Must include an explicit port.
+- `scopes` (optional): OAuth scopes to request.
+- `pkceDisabled` (bool, optional): disable PKCE. PKCE is enabled by default.
+
+Tokens are persisted to `<user config dir>/mcp-proxy/oauth/<server>.json`
+(e.g. `~/.config/mcp-proxy/oauth/notion.json` on Linux) and refreshed
+automatically using the stored refresh token as they expire. Before the
+daemon can use an `oauth`-configured server, you must authorize it once —
+see the `-authorize` flag in [USAGE.md](USAGE.md).
 
 ## options
 

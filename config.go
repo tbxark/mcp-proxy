@@ -22,15 +22,32 @@ type StdioMCPClientConfig struct {
 }
 
 type SSEMCPClientConfig struct {
-	URL     string            `json:"url"`
-	Headers map[string]string `json:"headers"`
+	URL     string             `json:"url"`
+	Headers map[string]string  `json:"headers"`
+	OAuth   *OAuthClientConfig `json:"oauth,omitempty"`
 }
 
 type StreamableMCPClientConfig struct {
-	URL     string            `json:"url"`
-	Headers map[string]string `json:"headers"`
-	Timeout time.Duration     `json:"timeout"`
+	URL     string             `json:"url"`
+	Headers map[string]string  `json:"headers"`
+	Timeout time.Duration      `json:"timeout"`
+	OAuth   *OAuthClientConfig `json:"oauth,omitempty"`
 }
+
+// OAuthClientConfig configures mcp-proxy as an OAuth client of a downstream
+// remote MCP server, for servers that require interactive OAuth and don't
+// accept a static bearer token (e.g. Notion's hosted MCP). ClientID/Secret
+// may be left empty to use RFC 7591 dynamic client registration, which the
+// authorize flow performs automatically on first run.
+type OAuthClientConfig struct {
+	ClientID     string   `json:"clientId,omitempty"`
+	ClientSecret string   `json:"clientSecret,omitempty"`
+	RedirectURI  string   `json:"redirectUri,omitempty"`
+	Scopes       []string `json:"scopes,omitempty"`
+	PKCEDisabled bool     `json:"pkceDisabled,omitempty"`
+}
+
+const defaultOAuthRedirectURI = "http://localhost:8090/oauth/callback"
 
 type MCPClientType string
 
@@ -87,9 +104,10 @@ type MCPClientConfigV2 struct {
 	Env     map[string]string `json:"env,omitempty"`
 
 	// SSE or Streamable HTTP
-	URL     string            `json:"url,omitempty"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Timeout time.Duration     `json:"timeout,omitempty"`
+	URL     string             `json:"url,omitempty"`
+	Headers map[string]string  `json:"headers,omitempty"`
+	Timeout time.Duration      `json:"timeout,omitempty"`
+	OAuth   *OAuthClientConfig `json:"oauth,omitempty"`
 
 	Options *OptionsV2 `json:"options,omitempty"`
 }
@@ -111,11 +129,13 @@ func parseMCPClientConfigV2(conf *MCPClientConfigV2) (any, error) {
 				URL:     conf.URL,
 				Headers: conf.Headers,
 				Timeout: conf.Timeout,
+				OAuth:   conf.OAuth,
 			}, nil
 		} else {
 			return &SSEMCPClientConfig{
 				URL:     conf.URL,
 				Headers: conf.Headers,
+				OAuth:   conf.OAuth,
 			}, nil
 		}
 	}
