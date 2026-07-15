@@ -122,7 +122,7 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 		}
 	}
 
-	log.Printf("<%s> Authorization successful, token saved", serverName)
+	log.Printf("<%s> Authorization successful, token saved. Restart the mcp-proxy daemon to pick it up (its HTTP route is only mounted on a successful connect at startup).", serverName)
 	return nil
 }
 
