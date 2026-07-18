@@ -45,6 +45,27 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			options: conf.Options,
 		}, nil
 	case *SSEMCPClientConfig:
+		if v.OAuth != nil {
+			oc, oErr := buildOAuthConfig(name, v.OAuth)
+			if oErr != nil {
+				return nil, oErr
+			}
+			var options []transport.ClientOption
+			if len(v.Headers) > 0 {
+				options = append(options, client.WithHeaders(v.Headers))
+			}
+			mcpClient, err := client.NewOAuthSSEClient(v.URL, oc, options...)
+			if err != nil {
+				return nil, err
+			}
+			return &Client{
+				name:            name,
+				needPing:        true,
+				needManualStart: true,
+				client:          mcpClient,
+				options:         conf.Options,
+			}, nil
+		}
 		var options []transport.ClientOption
 		if len(v.Headers) > 0 {
 			options = append(options, client.WithHeaders(v.Headers))
@@ -61,6 +82,30 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			options:         conf.Options,
 		}, nil
 	case *StreamableMCPClientConfig:
+		if v.OAuth != nil {
+			oc, oErr := buildOAuthConfig(name, v.OAuth)
+			if oErr != nil {
+				return nil, oErr
+			}
+			var options []transport.StreamableHTTPCOption
+			if len(v.Headers) > 0 {
+				options = append(options, transport.WithHTTPHeaders(v.Headers))
+			}
+			if v.Timeout > 0 {
+				options = append(options, transport.WithHTTPTimeout(v.Timeout))
+			}
+			mcpClient, err := client.NewOAuthStreamableHttpClient(v.URL, oc, options...)
+			if err != nil {
+				return nil, err
+			}
+			return &Client{
+				name:            name,
+				needPing:        true,
+				needManualStart: true,
+				client:          mcpClient,
+				options:         conf.Options,
+			}, nil
+		}
 		var options []transport.StreamableHTTPCOption
 		if len(v.Headers) > 0 {
 			options = append(options, transport.WithHTTPHeaders(v.Headers))
@@ -87,7 +132,7 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 	if c.needManualStart {
 		err := c.client.Start(ctx)
 		if err != nil {
-			return err
+			return oauthAwareError(c.name, err)
 		}
 	}
 	initRequest := mcp.InitializeRequest{}
@@ -100,7 +145,7 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 	}
 	_, err := c.client.Initialize(ctx, initRequest)
 	if err != nil {
-		return err
+		return oauthAwareError(c.name, err)
 	}
 	log.Printf("<%s> Successfully initialized MCP client", c.name)
 

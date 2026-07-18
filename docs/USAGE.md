@@ -8,6 +8,8 @@
 -http-headers string   optional headers for config URL: 'Key1:Value1;Key2:Value2'
 -http-timeout int      timeout (seconds) for remote config fetch (default 10)
 -insecure              skip TLS verification for remote config
+-authorize string      run a one-time interactive OAuth authorization for the
+                        named mcpServers entry, then exit
 -version               print version and exit
 -help                  print help and exit
 ```
@@ -43,4 +45,27 @@ Authorization: <token>
 ```
 
 If your client cannot set headers, embed the token in the route key (e.g. `fetch/<token>`) and call that path instead.
+
+## OAuth-authorizing a downstream server
+
+For servers configured with an `oauth` block (see [CONFIGURATION.md](CONFIGURATION.md#oauth)),
+run the authorization flow once, by hand, before starting (or restarting)
+the daemon:
+
+```bash
+mcp-proxy -authorize notion -config path/to/config.json
+```
+
+This opens your default browser to the provider's consent screen, waits
+for the local redirect callback, exchanges the code for a token, and saves
+it to disk. Run it interactively, in a session with a real browser -
+never from an unattended service/container, since it requires you to log
+in and approve access.
+
+Once authorized, (re)start the daemon. A server's HTTP route is only
+mounted on a successful connect at startup, so if the daemon was already
+running when you authorized, restart it now - the new token won't be
+picked up otherwise. After that, tokens refresh automatically as they
+expire with no further restarts needed. Re-run `-authorize` only if the
+server reports the token is no longer valid (e.g. access was revoked).
 

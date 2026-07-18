@@ -49,6 +49,15 @@ This project supports a v2 JSON configuration. v1 configs are automatically migr
       "options": {
         "disabled": true
       }
+    },
+    "notion": {
+      // streamable-http client requiring interactive OAuth (no static
+      // bearer token accepted) - see "oauth" below
+      "url": "https://mcp.notion.com/mcp",
+      "transportType": "streamable-http",
+      "oauth": {
+        "scopes": []
+      }
     }
   }
 }
@@ -75,7 +84,50 @@ Common fields:
 - `command`, `args`, `env` — for `stdio` clients.
 - `url`, `headers` — for `sse` and `streamable-http` clients.
 - `timeout` — request timeout for `streamable-http`.
+- `oauth` — for `sse` and `streamable-http` clients that require interactive OAuth instead of (or in addition to) `headers` (see below).
 - `options` — per‑server overrides and filters (see below).
+
+## oauth
+
+Some remote MCP servers (e.g. Notion's hosted MCP) require the full OAuth
+2.1 authorization-code flow and reject static bearer tokens outright. Set
+an `oauth` block on an `sse`/`streamable-http` server to have mcp-proxy act
+as the OAuth client on the downstream connection:
+
+- `clientId`, `clientSecret` (optional): static client credentials. Omit
+  both to use RFC 7591 dynamic client registration, which is performed
+  automatically the first time you authorize.
+- `redirectUri` (optional): local callback URL used during the one-time
+  interactive authorization. Defaults to `http://localhost:8090/oauth/callback`.
+  Must include an explicit port.
+- `scopes` (optional): OAuth scopes to request.
+- `pkceDisabled` (bool, optional): disable PKCE. PKCE is enabled by default.
+- `authServerMetadataUrl` (optional): override discovery of the authorization
+  server's metadata document. Needed for providers whose protected-resource
+  metadata (RFC 9728) advertises an `authorization_servers` entry with a
+  non-empty path (e.g. `https://mcp.example.com/v1/mcp`): this library's
+  discovery always appends `/.well-known/oauth-authorization-server` after
+  the full issuer URL (OpenID Connect Discovery convention), but RFC 8414
+  requires inserting it *before* the path when one is present, and some
+  providers (Datadog, at time of writing) only serve the document at the
+  RFC 8414 location. If servers connected via `oauth` fail discovery,
+  check `<issuer>/.well-known/oauth-authorization-server` vs.
+  `<scheme>://<host>/.well-known/oauth-authorization-server<path>` by hand
+  and set this field to whichever one responds.
+
+Tokens are persisted to `<user config dir>/mcp-proxy/oauth/<server>.json`
+(e.g. `~/.config/mcp-proxy/oauth/notion.json` on Linux) and refreshed
+automatically using the stored refresh token as they expire. Before the
+daemon can use an `oauth`-configured server, you must authorize it once —
+see the `-authorize` flag in [USAGE.md](USAGE.md).
+
+When `clientId` is left empty, the dynamically-registered client (RFC
+7591) is also persisted, to `<user config dir>/mcp-proxy/oauth/<server>.client.json`.
+This matters: registration only happens inside the one-off `-authorize`
+process, so without persisting it, a freshly started daemon would build a
+new OAuth handler with an empty client ID and every token refresh would
+silently be rejected by the provider once the access token expires -
+looking, from the logs, like a refresh failure with no obvious cause.
 
 ## options
 
