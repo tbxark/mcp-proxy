@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -147,7 +147,7 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 	if err != nil {
 		return oauthAwareError(c.name, err)
 	}
-	log.Printf("<%s> Successfully initialized MCP client", c.name)
+	slog.Info("Successfully initialized MCP client", "client", c.name)
 
 	err = c.addToolsToServer(ctx, mcpServer)
 	if err != nil {
@@ -172,7 +172,7 @@ func (c *Client) startPingTask(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("<%s> Context done, stopping ping", c.name)
+			slog.Debug("Context done, stopping ping", "client", c.name)
 			return
 		case <-ticker.C:
 			if err := c.client.Ping(ctx); err != nil {
@@ -180,9 +180,9 @@ func (c *Client) startPingTask(ctx context.Context) {
 					return
 				}
 				failCount++
-				log.Printf("<%s> MCP Ping failed: %v (count=%d)", c.name, err, failCount)
+				slog.Warn("MCP ping failed", "client", c.name, "err", err, "failures", failCount)
 			} else if failCount > 0 {
-				log.Printf("<%s> MCP Ping recovered after %d failures", c.name, failCount)
+				slog.Info("MCP ping recovered", "client", c.name, "failures", failCount)
 				failCount = 0
 			}
 		}
@@ -206,7 +206,7 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 			filterFunc = func(toolName string) bool {
 				_, inList := filterSet[toolName]
 				if !inList {
-					log.Printf("<%s> Ignoring tool %s as it is not in allow list", c.name, toolName)
+					slog.Debug("Ignoring tool not in allow list", "client", c.name, "tool", toolName)
 				}
 				return inList
 			}
@@ -214,12 +214,12 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 			filterFunc = func(toolName string) bool {
 				_, inList := filterSet[toolName]
 				if inList {
-					log.Printf("<%s> Ignoring tool %s as it is in block list", c.name, toolName)
+					slog.Debug("Ignoring tool in block list", "client", c.name, "tool", toolName)
 				}
 				return !inList
 			}
 		default:
-			log.Printf("<%s> Unknown tool filter mode: %s, skipping tool filter", c.name, mode)
+			slog.Warn("Unknown tool filter mode, skipping tool filter", "client", c.name, "mode", mode)
 		}
 	}
 
@@ -234,10 +234,10 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 		if len(tools.Tools) == 0 {
 			break
 		}
-		log.Printf("<%s> Successfully listed %d tools", c.name, len(tools.Tools))
+		slog.Debug("Successfully listed tools", "client", c.name, "count", len(tools.Tools))
 		for _, tool := range tools.Tools {
 			if filterFunc(tool.Name) {
-				log.Printf("<%s> Adding tool %s", c.name, tool.Name)
+				slog.Debug("Adding tool", "client", c.name, "tool", tool.Name)
 				mcpServer.AddTool(tool, c.client.CallTool)
 			}
 		}
@@ -263,9 +263,9 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 		if len(prompts.Prompts) == 0 {
 			break
 		}
-		log.Printf("<%s> Successfully listed %d prompts", c.name, len(prompts.Prompts))
+		slog.Debug("Successfully listed prompts", "client", c.name, "count", len(prompts.Prompts))
 		for _, prompt := range prompts.Prompts {
-			log.Printf("<%s> Adding prompt %s", c.name, prompt.Name)
+			slog.Debug("Adding prompt", "client", c.name, "prompt", prompt.Name)
 			mcpServer.AddPrompt(prompt, c.client.GetPrompt)
 		}
 		if prompts.NextCursor == "" {
@@ -289,9 +289,9 @@ func (c *Client) addResourcesToServer(ctx context.Context, mcpServer *server.MCP
 		if len(resources.Resources) == 0 {
 			break
 		}
-		log.Printf("<%s> Successfully listed %d resources", c.name, len(resources.Resources))
+		slog.Debug("Successfully listed resources", "client", c.name, "count", len(resources.Resources))
 		for _, resource := range resources.Resources {
-			log.Printf("<%s> Adding resource %s", c.name, resource.Name)
+			slog.Debug("Adding resource", "client", c.name, "resource", resource.Name)
 			mcpServer.AddResource(resource, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 				readResource, e := c.client.ReadResource(ctx, request)
 				if e != nil {
@@ -319,9 +319,9 @@ func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *se
 		if resourceTemplates == nil || len(resourceTemplates.ResourceTemplates) == 0 {
 			break
 		}
-		log.Printf("<%s> Successfully listed %d resource templates", c.name, len(resourceTemplates.ResourceTemplates))
+		slog.Debug("Successfully listed resource templates", "client", c.name, "count", len(resourceTemplates.ResourceTemplates))
 		for _, resourceTemplate := range resourceTemplates.ResourceTemplates {
-			log.Printf("<%s> Adding resource template %s", c.name, resourceTemplate.Name)
+			slog.Debug("Adding resource template", "client", c.name, "template", resourceTemplate.Name)
 			mcpServer.AddResourceTemplate(resourceTemplate, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 				readResource, e := c.client.ReadResource(ctx, request)
 				if e != nil {
@@ -352,12 +352,22 @@ type Server struct {
 }
 
 func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCPClientConfigV2) (*Server, error) {
+	if serverConfig == nil {
+		return nil, errors.New("server config is required")
+	}
+	if clientConfig == nil {
+		return nil, errors.New("client config is required")
+	}
+	clientOptions := clientConfig.Options
+	if clientOptions == nil {
+		clientOptions = &OptionsV2{}
+	}
 	serverOpts := []server.ServerOption{
 		server.WithResourceCapabilities(true, true),
 		server.WithRecovery(),
 	}
 
-	if clientConfig.Options.LogEnabled.OrElse(false) {
+	if clientOptions.LogEnabled.OrElse(false) {
 		serverOpts = append(serverOpts, server.WithLogging())
 	}
 	mcpServer := server.NewMCPServer(
@@ -388,8 +398,8 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 		handler:   handler,
 	}
 
-	if clientConfig.Options != nil && len(clientConfig.Options.AuthTokens) > 0 {
-		srv.tokens = clientConfig.Options.AuthTokens
+	if len(clientOptions.AuthTokens) > 0 {
+		srv.tokens = clientOptions.AuthTokens
 	}
 
 	return srv, nil

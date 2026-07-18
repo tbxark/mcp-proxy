@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,26 @@ func NewFileTokenStore(path string) *FileTokenStore {
 	return &FileTokenStore{path: path}
 }
 
+func oauthStorageName(serverName string) (string, error) {
+	if serverName == "" {
+		return "", errors.New("OAuth server name cannot be empty")
+	}
+	if serverName != "." && serverName != ".." && len(serverName) <= 128 {
+		safe := true
+		for _, r := range serverName {
+			if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '.' && r != '_' && r != '-' {
+				safe = false
+				break
+			}
+		}
+		if safe {
+			return serverName, nil
+		}
+	}
+	sum := sha256.Sum256([]byte(serverName))
+	return fmt.Sprintf("server-%x", sum[:12]), nil
+}
+
 // oauthTokenPath returns the on-disk path for a server's token file,
 // rooted under the user's config dir (~/.config/mcp-proxy/oauth on Linux).
 func oauthTokenPath(serverName string) (string, error) {
@@ -31,7 +52,11 @@ func oauthTokenPath(serverName string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to determine user config dir: %w", err)
 	}
-	return filepath.Join(dir, "mcp-proxy", "oauth", serverName+".json"), nil
+	storageName, err := oauthStorageName(serverName)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "mcp-proxy", "oauth", storageName+".json"), nil
 }
 
 func (s *FileTokenStore) GetToken(ctx context.Context) (*transport.Token, error) {
@@ -59,21 +84,56 @@ func (s *FileTokenStore) SaveToken(ctx context.Context, token *transport.Token) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if token == nil {
+		return errors.New("cannot save a nil OAuth token")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := os.MkdirAll(filepath.Dir(s.path), 0700); err != nil {
-		return fmt.Errorf("failed to create token directory: %w", err)
+	return writePrivateJSON(s.path, token)
+}
+
+func writePrivateJSON(path string, value any) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("failed to create OAuth storage directory: %w", err)
 	}
-	data, err := json.MarshalIndent(token, "", "  ")
+	if err := os.Chmod(dir, 0700); err != nil {
+		return fmt.Errorf("failed to secure OAuth storage directory: %w", err)
+	}
+	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal token: %w", err)
+		return fmt.Errorf("failed to marshal OAuth data: %w", err)
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return fmt.Errorf("failed to write token file %s: %w", tmp, err)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary OAuth file: %w", err)
 	}
-	return os.Rename(tmp, s.path)
+	tmpPath := tmp.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = tmp.Close()
+		}
+		_ = os.Remove(tmpPath)
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		return fmt.Errorf("failed to secure temporary OAuth file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("failed to write temporary OAuth file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("failed to sync temporary OAuth file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary OAuth file: %w", err)
+	}
+	closed = true
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("failed to replace OAuth file %s: %w", path, err)
+	}
+	return nil
 }
 
 // registeredClient is what oauthClientPath persists: the client_id (and
@@ -95,7 +155,11 @@ func oauthClientPath(serverName string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to determine user config dir: %w", err)
 	}
-	return filepath.Join(dir, "mcp-proxy", "oauth", serverName+".client.json"), nil
+	storageName, err := oauthStorageName(serverName)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "mcp-proxy", "oauth", storageName+".client.json"), nil
 }
 
 // loadRegisteredClient returns (clientID, clientSecret, true) if a
@@ -117,6 +181,9 @@ func loadRegisteredClient(serverName string) (string, string, bool, error) {
 	if err := json.Unmarshal(data, &rc); err != nil {
 		return "", "", false, fmt.Errorf("failed to parse client file %s: %w", path, err)
 	}
+	if rc.ClientID == "" {
+		return "", "", false, fmt.Errorf("client file %s does not contain a clientId", path)
+	}
 	return rc.ClientID, rc.ClientSecret, true, nil
 }
 
@@ -128,16 +195,8 @@ func saveRegisteredClient(serverName, clientID, clientSecret string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return fmt.Errorf("failed to create client directory: %w", err)
+	if clientID == "" {
+		return errors.New("cannot save an empty OAuth clientId")
 	}
-	data, err := json.MarshalIndent(registeredClient{ClientID: clientID, ClientSecret: clientSecret}, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal client: %w", err)
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return fmt.Errorf("failed to write client file %s: %w", tmp, err)
-	}
-	return os.Rename(tmp, path)
+	return writePrivateJSON(path, registeredClient{ClientID: clientID, ClientSecret: clientSecret})
 }

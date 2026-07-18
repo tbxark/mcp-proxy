@@ -4,7 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -54,7 +55,7 @@ func newAuthMiddleware(tokens []string) MiddlewareFunc {
 func loggerMiddleware(prefix string) MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			log.Printf("<%s> Request [%s] %s", prefix, r.Method, r.URL.Path)
+			slog.Info("Request", "client", prefix, "method", r.Method, "path", r.URL.Path)
 			next.ServeHTTP(w, r)
 		})
 	}
@@ -65,7 +66,7 @@ func recoverMiddleware(prefix string) MiddlewareFunc {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if err := recover(); err != nil {
-					log.Printf("<%s> Recovered from panic: %v", prefix, err)
+					slog.Error("Recovered from panic", "client", prefix, "err", err)
 					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 				}
 			}()
@@ -123,6 +124,7 @@ func startHTTPServer(config *Config) error {
 	info := mcp.Implementation{
 		Name: config.McpProxy.Name,
 	}
+	clients := make(map[string]*Client, len(config.McpServers))
 
 	// Unauthenticated health endpoints for liveness/readiness probes.
 	health := healthHandler(config)
@@ -131,7 +133,7 @@ func startHTTPServer(config *Config) error {
 
 	for name, clientConfig := range config.McpServers {
 		if clientConfig.Options.Disabled {
-			log.Printf("<%s> Disabled", name)
+			slog.Info("Disabled", "client", name)
 			continue
 		}
 		mcpClient, err := newMCPClient(name, clientConfig)
@@ -142,17 +144,18 @@ func startHTTPServer(config *Config) error {
 		if err != nil {
 			return err
 		}
+		clients[name] = mcpClient
 		errorGroup.Go(func() error {
-			log.Printf("<%s> Connecting", name)
+			slog.Info("Connecting", "client", name)
 			addErr := mcpClient.addToMCPServer(ctx, info, server.mcpServer)
 			if addErr != nil {
-				log.Printf("<%s> Failed to add client to server: %v", name, addErr)
+				slog.Error("Failed to add client to server", "client", name, "err", addErr)
 				if clientConfig.Options.PanicIfInvalid.OrElse(false) {
 					return addErr
 				}
 				return nil
 			}
-			log.Printf("<%s> Connected", name)
+			slog.Info("Connected", "client", name)
 
 			middlewares := make([]MiddlewareFunc, 0)
 			middlewares = append(middlewares, recoverMiddleware(name))
@@ -169,45 +172,66 @@ func startHTTPServer(config *Config) error {
 			if !strings.HasSuffix(mcpRoute, "/") {
 				mcpRoute += "/"
 			}
-			log.Printf("<%s> Handling requests at %s", name, mcpRoute)
+			slog.Info("Handling requests", "client", name, "route", mcpRoute)
 			httpMux.Handle(mcpRoute, chainMiddleware(server.handler, middlewares...))
-			httpServer.RegisterOnShutdown(func() {
-				log.Printf("<%s> Shutting down", name)
-				_ = mcpClient.Close()
-			})
 			return nil
 		})
 	}
 
+	initializationDone := make(chan error, 1)
 	go func() {
-		err := errorGroup.Wait()
-		if err != nil {
-			log.Fatalf("Failed to add clients: %v", err)
-		}
-		log.Printf("All clients initialized")
+		initializationDone <- errorGroup.Wait()
 	}()
 
+	serverDone := make(chan error, 1)
 	go func() {
-		log.Printf("Starting %s server", config.McpProxy.Type)
-		log.Printf("%s server listening on %s", config.McpProxy.Type, config.McpProxy.Addr)
+		slog.Info("Starting server", "type", config.McpProxy.Type, "addr", config.McpProxy.Addr)
 		hErr := httpServer.ListenAndServe()
-		if hErr != nil && !errors.Is(hErr, http.ErrServerClosed) {
-			log.Fatalf("Failed to start server: %v", hErr)
+		if errors.Is(hErr, http.ErrServerClosed) {
+			hErr = nil
 		}
+		serverDone <- hErr
 	}()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 
-	<-sigChan
-	log.Println("Shutdown signal received")
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer shutdownCancel()
-
-	err := httpServer.Shutdown(shutdownCtx)
-	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	shutdown := func() error {
+		cancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		var shutdownErrors []error
+		if err := httpServer.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			shutdownErrors = append(shutdownErrors, err)
+		}
+		for name, client := range clients {
+			slog.Info("Shutting down", "client", name)
+			if err := client.Close(); err != nil {
+				shutdownErrors = append(shutdownErrors, fmt.Errorf("close client %q: %w", name, err))
+			}
+		}
+		return errors.Join(shutdownErrors...)
 	}
-	return nil
+
+	for {
+		select {
+		case err := <-initializationDone:
+			initializationDone = nil
+			if err != nil {
+				_ = shutdown()
+				return fmt.Errorf("failed to initialize clients: %w", err)
+			}
+			slog.Info("All clients initialized")
+		case err := <-serverDone:
+			_ = shutdown()
+			if err != nil {
+				return fmt.Errorf("HTTP server failed: %w", err)
+			}
+			return nil
+		case <-sigChan:
+			slog.Info("Shutdown signal received")
+			return shutdown()
+		}
+	}
 }

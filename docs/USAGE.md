@@ -10,9 +10,25 @@
 -insecure              skip TLS verification for remote config
 -authorize string      run a one-time interactive OAuth authorization for the
                         named mcpServers entry, then exit
+-check-config          load and validate the config, then exit
+-log-level value       log level: debug, info, warn, or error (default info)
 -version               print version and exit
 -help                  print help and exit
 ```
+
+## Validating configuration
+
+Use `-check-config` in CI, init containers, or deployment scripts to validate
+the proxy settings and every downstream server without binding the HTTP port:
+
+```bash
+mcp-proxy -config config.json -check-config
+# Config OK: 3 MCP server(s) configured
+```
+
+Validation includes transport requirements, absolute HTTP URLs, OAuth callback
+safety, authentication tokens, and tool-filter modes. Invalid configuration
+exits non-zero with the affected field or server name.
 
 ## Endpoints
 
@@ -68,4 +84,3 @@ running when you authorized, restart it now - the new token won't be
 picked up otherwise. After that, tokens refresh automatically as they
 expire with no further restarts needed. Re-run `-authorize` only if the
 server reports the token is no longer valid (e.g. access was revoked).
-

@@ -99,7 +99,9 @@ as the OAuth client on the downstream connection:
   automatically the first time you authorize.
 - `redirectUri` (optional): local callback URL used during the one-time
   interactive authorization. Defaults to `http://localhost:8090/oauth/callback`.
-  Must include an explicit port.
+  It must use `http`, a loopback host (`localhost`, `127.0.0.1`, or `::1`), an
+  explicit port, and a non-root callback path. The callback listener never
+  binds to a public interface.
 - `scopes` (optional): OAuth scopes to request.
 - `pkceDisabled` (bool, optional): disable PKCE. PKCE is enabled by default.
 - `authServerMetadataUrl` (optional): override discovery of the authorization
@@ -143,4 +145,3 @@ Notes:
 
 - `mcpProxy.options.authTokens` serves as the default token set if a server omits `options.authTokens`.
 - To discover tool names for filtering, start without a filter and check logs for lines like `<server> Adding tool <name>`.
-
