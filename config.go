@@ -3,7 +3,9 @@ package main
 import (
 	"crypto/tls"
 	"errors"
+	"fmt"
 	nethttp "net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -123,33 +125,162 @@ type MCPClientConfigV2 struct {
 }
 
 func parseMCPClientConfigV2(conf *MCPClientConfigV2) (any, error) {
-	if conf.Command != "" || conf.TransportType == MCPClientTypeStdio {
+	if conf == nil {
+		return nil, errors.New("server config is null")
+	}
+	if conf.Command != "" && conf.URL != "" {
+		return nil, errors.New("command and url are mutually exclusive")
+	}
+
+	transportType := conf.TransportType
+	if transportType == "" {
+		switch {
+		case conf.Command != "":
+			transportType = MCPClientTypeStdio
+		case conf.URL != "":
+			transportType = MCPClientTypeSSE
+		default:
+			return nil, errors.New("command or url is required")
+		}
+	}
+
+	switch transportType {
+	case MCPClientTypeStdio:
 		if conf.Command == "" {
 			return nil, errors.New("command is required for stdio transport")
+		}
+		if conf.OAuth != nil {
+			return nil, errors.New("oauth is not supported for stdio transport")
 		}
 		return &StdioMCPClientConfig{
 			Command: conf.Command,
 			Env:     conf.Env,
 			Args:    conf.Args,
 		}, nil
+	case MCPClientTypeSSE:
+		if conf.URL == "" {
+			return nil, errors.New("url is required for sse transport")
+		}
+		return &SSEMCPClientConfig{
+			URL:     conf.URL,
+			Headers: conf.Headers,
+			OAuth:   conf.OAuth,
+		}, nil
+	case MCPClientTypeStreamable:
+		if conf.URL == "" {
+			return nil, errors.New("url is required for streamable-http transport")
+		}
+		if conf.Timeout < 0 {
+			return nil, errors.New("timeout cannot be negative")
+		}
+		return &StreamableMCPClientConfig{
+			URL:     conf.URL,
+			Headers: conf.Headers,
+			Timeout: conf.Timeout,
+			OAuth:   conf.OAuth,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported transportType %q", conf.TransportType)
 	}
-	if conf.URL != "" {
-		if conf.TransportType == MCPClientTypeStreamable {
-			return &StreamableMCPClientConfig{
-				URL:     conf.URL,
-				Headers: conf.Headers,
-				Timeout: conf.Timeout,
-				OAuth:   conf.OAuth,
-			}, nil
-		} else {
-			return &SSEMCPClientConfig{
-				URL:     conf.URL,
-				Headers: conf.Headers,
-				OAuth:   conf.OAuth,
-			}, nil
+}
+
+func validateHTTPURL(field, rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("%s is invalid: %w", field, err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("%s must be an absolute http(s) URL", field)
+	}
+	return nil
+}
+
+func validateOptions(field string, options *OptionsV2) error {
+	if options == nil {
+		return nil
+	}
+	for i, token := range options.AuthTokens {
+		if strings.TrimSpace(token) == "" {
+			return fmt.Errorf("%s.authTokens[%d] cannot be empty", field, i)
 		}
 	}
-	return nil, errors.New("invalid server type")
+	if options.ToolFilter == nil {
+		return nil
+	}
+	mode := ToolFilterMode(strings.ToLower(string(options.ToolFilter.Mode)))
+	if mode != ToolFilterModeAllow && mode != ToolFilterModeBlock {
+		return fmt.Errorf("%s.toolFilter.mode must be %q or %q", field, ToolFilterModeAllow, ToolFilterModeBlock)
+	}
+	for i, toolName := range options.ToolFilter.List {
+		if strings.TrimSpace(toolName) == "" {
+			return fmt.Errorf("%s.toolFilter.list[%d] cannot be empty", field, i)
+		}
+	}
+	return nil
+}
+
+func validateConfig(config *Config) error {
+	if config == nil || config.McpProxy == nil {
+		return errors.New("mcpProxy is required")
+	}
+	proxy := config.McpProxy
+	if err := validateHTTPURL("mcpProxy.baseURL", proxy.BaseURL); err != nil {
+		return err
+	}
+	if strings.TrimSpace(proxy.Addr) == "" {
+		return errors.New("mcpProxy.addr is required")
+	}
+	if strings.TrimSpace(proxy.Name) == "" {
+		return errors.New("mcpProxy.name is required")
+	}
+	if strings.TrimSpace(proxy.Version) == "" {
+		return errors.New("mcpProxy.version is required")
+	}
+	if proxy.Type != MCPServerTypeSSE && proxy.Type != MCPServerTypeStreamable {
+		return fmt.Errorf("mcpProxy.type must be %q or %q", MCPServerTypeSSE, MCPServerTypeStreamable)
+	}
+	if err := validateOptions("mcpProxy.options", proxy.Options); err != nil {
+		return err
+	}
+
+	for name, serverConfig := range config.McpServers {
+		field := fmt.Sprintf("mcpServers[%q]", name)
+		if strings.TrimSpace(name) == "" {
+			return errors.New("mcpServers contains an empty server name")
+		}
+		if serverConfig == nil {
+			return fmt.Errorf("%s cannot be null", field)
+		}
+		if _, err := parseMCPClientConfigV2(serverConfig); err != nil {
+			return fmt.Errorf("%s: %w", field, err)
+		}
+		if serverConfig.URL != "" {
+			if err := validateHTTPURL(field+".url", serverConfig.URL); err != nil {
+				return err
+			}
+		}
+		if err := validateOptions(field+".options", serverConfig.Options); err != nil {
+			return err
+		}
+		if serverConfig.OAuth != nil {
+			if serverConfig.OAuth.ClientID == "" && serverConfig.OAuth.ClientSecret != "" {
+				return fmt.Errorf("%s.oauth.clientSecret requires clientId", field)
+			}
+			redirectURI := serverConfig.OAuth.RedirectURI
+			if redirectURI == "" {
+				redirectURI = defaultOAuthRedirectURI
+			}
+			if _, _, err := parseRedirectURI(redirectURI); err != nil {
+				return fmt.Errorf("%s.oauth.redirectUri: %w", field, err)
+			}
+			if metadataURL := serverConfig.OAuth.AuthServerMetadataURL; metadataURL != "" {
+				if err := validateHTTPURL(field+".oauth.authServerMetadataUrl", metadataURL); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // ---- Config ----
@@ -231,7 +362,10 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 	if conf.McpProxy.Options == nil {
 		conf.McpProxy.Options = &OptionsV2{}
 	}
-	for _, clientConfig := range conf.McpServers {
+	for name, clientConfig := range conf.McpServers {
+		if clientConfig == nil {
+			return nil, fmt.Errorf("mcpServers[%q] cannot be null", name)
+		}
 		if clientConfig.Options == nil {
 			clientConfig.Options = &OptionsV2{}
 		}
@@ -250,8 +384,12 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 		conf.McpProxy.Type = MCPServerTypeSSE // default to SSE
 	}
 
-	return &Config{
+	config := &Config{
 		McpProxy:   conf.McpProxy,
 		McpServers: conf.McpServers,
-	}, nil
+	}
+	if err := validateConfig(config); err != nil {
+		return nil, err
+	}
+	return config, nil
 }

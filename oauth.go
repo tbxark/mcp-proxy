@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os/exec"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/client"
@@ -92,7 +95,11 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 		if bErr != nil {
 			return bErr
 		}
-		mcpClient, err = client.NewOAuthSSEClient(v.URL, oc)
+		var options []transport.ClientOption
+		if len(v.Headers) > 0 {
+			options = append(options, client.WithHeaders(v.Headers))
+		}
+		mcpClient, err = client.NewOAuthSSEClient(v.URL, oc, options...)
 	case *StreamableMCPClientConfig:
 		if v.OAuth == nil {
 			return fmt.Errorf("server %q has no oauth config; add mcpServers.%s.oauth to config.json first", serverName, serverName)
@@ -102,7 +109,14 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 		if bErr != nil {
 			return bErr
 		}
-		mcpClient, err = client.NewOAuthStreamableHttpClient(v.URL, oc)
+		var options []transport.StreamableHTTPCOption
+		if len(v.Headers) > 0 {
+			options = append(options, transport.WithHTTPHeaders(v.Headers))
+		}
+		if v.Timeout > 0 {
+			options = append(options, transport.WithHTTPTimeout(v.Timeout))
+		}
+		mcpClient, err = client.NewOAuthStreamableHttpClient(v.URL, oc, options...)
 	default:
 		return errors.New("invalid client type")
 	}
@@ -140,7 +154,7 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 		}
 	}
 
-	log.Printf("<%s> Authorization successful, token saved. Restart the mcp-proxy daemon to pick it up (its HTTP route is only mounted on a successful connect at startup).", serverName)
+	slog.Info("Authorization successful; restart the daemon to mount the server route", "server", serverName)
 	return nil
 }
 
@@ -157,10 +171,6 @@ func authorizeInteractively(ctx context.Context, err error, serverName, redirect
 		return pErr
 	}
 
-	callbackChan := make(chan map[string]string, 1)
-	srv := startOAuthCallbackServer(addr, callbackPath, callbackChan)
-	defer srv.Close()
-
 	codeVerifier, err := client.GenerateCodeVerifier()
 	if err != nil {
 		return fmt.Errorf("failed to generate PKCE code verifier: %w", err)
@@ -171,6 +181,13 @@ func authorizeInteractively(ctx context.Context, err error, serverName, redirect
 	if err != nil {
 		return fmt.Errorf("failed to generate state: %w", err)
 	}
+
+	callbackChan := make(chan map[string]string, 1)
+	srv, err := startOAuthCallbackServer(addr, callbackPath, state, callbackChan)
+	if err != nil {
+		return fmt.Errorf("failed to start OAuth callback server: %w", err)
+	}
+	defer srv.Close()
 
 	if oauthHandler.GetClientID() == "" {
 		if err := oauthHandler.RegisterClient(ctx, "mcp-proxy ("+serverName+")"); err != nil {
@@ -186,10 +203,10 @@ func authorizeInteractively(ctx context.Context, err error, serverName, redirect
 		return fmt.Errorf("failed to build authorization URL: %w", err)
 	}
 
-	log.Printf("<%s> Opening browser for authorization: %s", serverName, authURL)
+	slog.Info("Opening browser for authorization", "server", serverName, "url", authURL)
 	openBrowser(authURL)
 
-	log.Printf("<%s> Waiting for authorization callback on %s ...", serverName, redirectURI)
+	slog.Info("Waiting for authorization callback", "server", serverName, "redirect_uri", redirectURI)
 	select {
 	case params := <-callbackChan:
 		if errMsg := params["error"]; errMsg != "" {
@@ -226,35 +243,79 @@ func parseRedirectURI(redirectURI string) (path string, addr string, err error) 
 	if err != nil {
 		return "", "", fmt.Errorf("invalid redirect URI %q: %w", redirectURI, err)
 	}
-	host := u.Host
-	if u.Port() == "" {
+	if u.Scheme != "http" {
+		return "", "", fmt.Errorf("redirect URI %q must use http", redirectURI)
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", "", fmt.Errorf("redirect URI %q cannot contain user info, query, or fragment", redirectURI)
+	}
+	hostname := u.Hostname()
+	if hostname == "" {
+		return "", "", fmt.Errorf("redirect URI %q must include a host", redirectURI)
+	}
+	ip := net.ParseIP(hostname)
+	if !strings.EqualFold(hostname, "localhost") && (ip == nil || !ip.IsLoopback()) {
+		return "", "", fmt.Errorf("redirect URI %q must use localhost or a loopback IP", redirectURI)
+	}
+	port := u.Port()
+	if port == "" {
 		return "", "", fmt.Errorf("redirect URI %q must include an explicit port", redirectURI)
 	}
-	return u.Path, host, nil
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", "", fmt.Errorf("redirect URI %q contains an invalid port", redirectURI)
+	}
+	if u.Path == "" || u.Path == "/" {
+		return "", "", fmt.Errorf("redirect URI %q must include a callback path", redirectURI)
+	}
+	return u.Path, net.JoinHostPort(hostname, port), nil
 }
 
-func startOAuthCallbackServer(addr, callbackPath string, callbackChan chan<- map[string]string) *http.Server {
-	mux := http.NewServeMux()
-	srv := &http.Server{Addr: addr, Handler: mux}
+func startOAuthCallbackServer(addr, callbackPath, expectedState string, callbackChan chan<- map[string]string) (*http.Server, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
 
-	mux.HandleFunc(callbackPath, func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != callbackPath {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.URL.Query().Get("state") != expectedState {
+			http.Error(w, "Invalid OAuth state", http.StatusBadRequest)
+			return
+		}
 		params := make(map[string]string)
 		for key, values := range r.URL.Query() {
 			if len(values) > 0 {
 				params[key] = values[0]
 			}
 		}
-		w.Header().Set("Content-Type", "text/html")
-		_, _ = w.Write([]byte(`<html><body><h1>Authorization received</h1><p>You can close this window and return to the terminal.</p></body></html>`))
-		callbackChan <- params
+		select {
+		case callbackChan <- params:
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html><body><h1>Authorization received</h1><p>You can close this window and return to the terminal.</p></body></html>`))
+		default:
+			http.Error(w, "OAuth callback already received", http.StatusConflict)
+		}
 	})
+	srv := &http.Server{
+		Addr:              listener.Addr().String(),
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("OAuth callback server error: %v", err)
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("OAuth callback server error", "err", err)
 		}
 	}()
-	return srv
+	return srv, nil
 }
 
 func openBrowser(rawURL string) {
@@ -270,6 +331,6 @@ func openBrowser(rawURL string) {
 		err = fmt.Errorf("unsupported platform %s", runtime.GOOS)
 	}
 	if err != nil {
-		log.Printf("Could not open browser automatically (%v); open this URL manually:\n  %s", err, rawURL)
+		slog.Warn("Could not open browser automatically; open the URL manually", "err", err, "url", rawURL)
 	}
 }
