@@ -1,9 +1,11 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -21,6 +23,57 @@ type Client struct {
 	needManualStart bool
 	client          *client.Client
 	options         *OptionsV2
+}
+
+// gzipSafetyNetTransport ensures gzip-encoded responses are always decoded.
+// Go's stdlib transport only auto-decompresses when it added the
+// "Accept-Encoding: gzip" header itself; some upstream servers (e.g.
+// mcp.slack.com, likely via a fronting CDN) send gzip-encoded responses
+// regardless of what Accept-Encoding the client sent, which slips past
+// Go's automatic decoding and hands raw gzip bytes to the JSON decoder. This
+// wrapper decodes manually whenever Content-Encoding: gzip is still present
+// on the response, which only happens when Go didn't already handle it —
+// so it's a no-op, not a double-decode, whenever Go's automatic path works.
+type gzipSafetyNetTransport struct {
+	next http.RoundTripper
+}
+
+func (t *gzipSafetyNetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.next.RoundTrip(req)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	if !strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		return resp, nil
+	}
+	gz, gzErr := gzip.NewReader(resp.Body)
+	if gzErr != nil {
+		return resp, gzErr
+	}
+	resp.Body = &gzipReadCloser{gz: gz, orig: resp.Body}
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Content-Length")
+	resp.ContentLength = -1
+	return resp, nil
+}
+
+type gzipReadCloser struct {
+	gz   *gzip.Reader
+	orig io.Closer
+}
+
+func (g *gzipReadCloser) Read(p []byte) (int, error) {
+	return g.gz.Read(p)
+}
+
+func (g *gzipReadCloser) Close() error {
+	_ = g.gz.Close()
+	return g.orig.Close()
+}
+
+func newHTTPClient() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	return &http.Client{Transport: &gzipSafetyNetTransport{next: tr}}
 }
 
 func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
@@ -50,7 +103,7 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			if oErr != nil {
 				return nil, oErr
 			}
-			var options []transport.ClientOption
+			options := []transport.ClientOption{client.WithHTTPClient(newHTTPClient())}
 			if len(v.Headers) > 0 {
 				options = append(options, client.WithHeaders(v.Headers))
 			}
@@ -66,7 +119,7 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 				options:         conf.Options,
 			}, nil
 		}
-		var options []transport.ClientOption
+		options := []transport.ClientOption{client.WithHTTPClient(newHTTPClient())}
 		if len(v.Headers) > 0 {
 			options = append(options, client.WithHeaders(v.Headers))
 		}
@@ -87,7 +140,10 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			if oErr != nil {
 				return nil, oErr
 			}
-			var options []transport.StreamableHTTPCOption
+			// WithHTTPBasicClient must come first: WithHTTPTimeout mutates
+			// whatever *http.Client is already set, so it has to run after
+			// the client is swapped in.
+			options := []transport.StreamableHTTPCOption{transport.WithHTTPBasicClient(newHTTPClient())}
 			if len(v.Headers) > 0 {
 				options = append(options, transport.WithHTTPHeaders(v.Headers))
 			}
@@ -106,7 +162,10 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 				options:         conf.Options,
 			}, nil
 		}
-		var options []transport.StreamableHTTPCOption
+		// WithHTTPBasicClient must come first: WithHTTPTimeout mutates
+		// whatever *http.Client is already set, so it has to run after the
+		// client is swapped in.
+		options := []transport.StreamableHTTPCOption{transport.WithHTTPBasicClient(newHTTPClient())}
 		if len(v.Headers) > 0 {
 			options = append(options, transport.WithHTTPHeaders(v.Headers))
 		}
