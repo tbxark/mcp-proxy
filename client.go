@@ -238,7 +238,14 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 		for _, tool := range tools.Tools {
 			if filterFunc(tool.Name) {
 				slog.Debug("Adding tool", "client", c.name, "tool", tool.Name)
-				mcpServer.AddTool(tool, c.client.CallTool)
+				toolName := tool.Name
+				mcpServer.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+					result, err := c.client.CallTool(ctx, request)
+					if err != nil {
+						slog.Error("Tool call failed", "client", c.name, "tool", toolName, "error", err)
+					}
+					return result, err
+				})
 			}
 		}
 		if tools.NextCursor == "" {
