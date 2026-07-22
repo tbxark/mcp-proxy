@@ -23,6 +23,23 @@ type Client struct {
 	options         *OptionsV2
 }
 
+const acceptEncodingHeader = "Accept-Encoding"
+
+// mcpHTTPHeaders returns a copy of headers that explicitly opts out of response
+// compression. Some MCP servers otherwise return gzip data that reaches the JSON
+// decoder without being decompressed by Go's HTTP transport.
+func mcpHTTPHeaders(headers map[string]string) map[string]string {
+	result := make(map[string]string, len(headers)+1)
+	for key, value := range headers {
+		if strings.EqualFold(key, acceptEncodingHeader) {
+			continue
+		}
+		result[key] = value
+	}
+	result[acceptEncodingHeader] = "identity"
+	return result
+}
+
 func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 	clientInfo, pErr := parseMCPClientConfigV2(conf)
 	if pErr != nil {
@@ -50,10 +67,7 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			if oErr != nil {
 				return nil, oErr
 			}
-			var options []transport.ClientOption
-			if len(v.Headers) > 0 {
-				options = append(options, client.WithHeaders(v.Headers))
-			}
+			options := []transport.ClientOption{client.WithHeaders(mcpHTTPHeaders(v.Headers))}
 			mcpClient, err := client.NewOAuthSSEClient(v.URL, oc, options...)
 			if err != nil {
 				return nil, err
@@ -66,10 +80,7 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 				options:         conf.Options,
 			}, nil
 		}
-		var options []transport.ClientOption
-		if len(v.Headers) > 0 {
-			options = append(options, client.WithHeaders(v.Headers))
-		}
+		options := []transport.ClientOption{client.WithHeaders(mcpHTTPHeaders(v.Headers))}
 		mcpClient, err := client.NewSSEMCPClient(v.URL, options...)
 		if err != nil {
 			return nil, err
@@ -87,10 +98,7 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			if oErr != nil {
 				return nil, oErr
 			}
-			var options []transport.StreamableHTTPCOption
-			if len(v.Headers) > 0 {
-				options = append(options, transport.WithHTTPHeaders(v.Headers))
-			}
+			options := []transport.StreamableHTTPCOption{transport.WithHTTPHeaders(mcpHTTPHeaders(v.Headers))}
 			if v.Timeout > 0 {
 				options = append(options, transport.WithHTTPTimeout(v.Timeout))
 			}
@@ -106,10 +114,7 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 				options:         conf.Options,
 			}, nil
 		}
-		var options []transport.StreamableHTTPCOption
-		if len(v.Headers) > 0 {
-			options = append(options, transport.WithHTTPHeaders(v.Headers))
-		}
+		options := []transport.StreamableHTTPCOption{transport.WithHTTPHeaders(mcpHTTPHeaders(v.Headers))}
 		if v.Timeout > 0 {
 			options = append(options, transport.WithHTTPTimeout(v.Timeout))
 		}
