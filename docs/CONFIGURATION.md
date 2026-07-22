@@ -81,11 +81,38 @@ Each entry defines a downstream MCP server. Supported client types:
 
 Common fields:
 
-- `command`, `args`, `env` — for `stdio` clients.
-- `url`, `headers` — for `sse` and `streamable-http` clients.
-- `timeout` — request timeout for `streamable-http`.
-- `oauth` — for `sse` and `streamable-http` clients that require interactive OAuth instead of (or in addition to) `headers` (see below).
-- `options` — per‑server overrides and filters (see below).
+- `command`, `args`, `env` - for `stdio` clients.
+- `url`, `headers` - for `sse` and `streamable-http` clients.
+- `timeout` - request timeout for `streamable-http`, encoded as a Go `time.Duration` in nanoseconds.
+- `oauth` - for `sse` and `streamable-http` clients that require interactive OAuth instead of (or in addition to) `headers` (see below).
+- `options` - per‑server overrides and filters (see below).
+
+### Remote streamable HTTP example
+
+Use `transportType: "streamable-http"` for a hosted MCP server. This example
+connects Xquik, passes an API key as a bearer token, and applies a 30-second
+timeout. Xquik exposes the `explore` and `xquik` tools.
+
+```jsonc
+{
+  "mcpServers": {
+    "xquik": {
+      "transportType": "streamable-http",
+      "url": "https://xquik.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${XQUIK_API_KEY}"
+      },
+      "timeout": 30000000000,
+      "options": {
+        "toolFilter": {
+          "mode": "allow",
+          "list": ["explore", "xquik"]
+        }
+      }
+    }
+  }
+}
+```
 
 ## oauth
 
@@ -120,7 +147,7 @@ as the OAuth client on the downstream connection:
 Tokens are persisted to `<user config dir>/mcp-proxy/oauth/<server>.json`
 (e.g. `~/.config/mcp-proxy/oauth/notion.json` on Linux) and refreshed
 automatically using the stored refresh token as they expire. Before the
-daemon can use an `oauth`-configured server, you must authorize it once —
+daemon can use an `oauth`-configured server, you must authorize it once -
 see the `-authorize` flag in [USAGE.md](USAGE.md).
 
 When `clientId` is left empty, the dynamically-registered client (RFC
@@ -139,7 +166,7 @@ looking, from the logs, like a refresh failure with no obvious cause.
 - `toolFilter` (object): Selectively expose tools to the proxy:
   - `mode`: `allow` or `block`.
   - `list`: List of tool names.
-- `Disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
+- `disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
 
 Notes:
 
