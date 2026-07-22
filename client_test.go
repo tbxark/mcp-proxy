@@ -3,8 +3,83 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"github.com/mark3labs/mcp-go/mcp"
 )
+
+func TestMCPHTTPClientRequestsUncompressedResponses(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(acceptEncodingHeader); got != "identity" {
+			http.Error(w, "expected Accept-Encoding: identity, got "+got, http.StatusBadRequest)
+			return
+		}
+		if got := r.Header.Get("X-Test"); got != "value" {
+			http.Error(w, "expected X-Test header, got "+got, http.StatusBadRequest)
+			return
+		}
+
+		var request struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if request.Method != string(mcp.MethodInitialize) {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      request.ID,
+			"result": map[string]any{
+				"protocolVersion": mcp.LATEST_PROTOCOL_VERSION,
+				"capabilities":    map[string]any{},
+				"serverInfo": map[string]string{
+					"name":    "test",
+					"version": "test",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	configuredHeaders := map[string]string{
+		"accept-encoding": "gzip",
+		"X-Test":          "value",
+	}
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           server.URL,
+		Headers:       configuredHeaders,
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer mcpClient.Close()
+
+	ctx := t.Context()
+	if err := mcpClient.client.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	request := mcp.InitializeRequest{}
+	request.Params.ClientInfo = mcp.Implementation{Name: "test", Version: "test"}
+	if _, err := mcpClient.client.Initialize(ctx, request); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	if got := configuredHeaders["accept-encoding"]; got != "gzip" {
+		t.Fatalf("configured headers were mutated: got %q", got)
+	}
+}
 
 // Regression for https://github.com/tbxark/mcp-proxy/issues/66 — JetBrains MCP
 // clients reject null resource lists; empty collections must serialize as [].

@@ -95,10 +95,7 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 		if bErr != nil {
 			return bErr
 		}
-		var options []transport.ClientOption
-		if len(v.Headers) > 0 {
-			options = append(options, client.WithHeaders(v.Headers))
-		}
+		options := []transport.ClientOption{client.WithHeaders(mcpHTTPHeaders(v.Headers))}
 		mcpClient, err = client.NewOAuthSSEClient(v.URL, oc, options...)
 	case *StreamableMCPClientConfig:
 		if v.OAuth == nil {
@@ -109,10 +106,7 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 		if bErr != nil {
 			return bErr
 		}
-		var options []transport.StreamableHTTPCOption
-		if len(v.Headers) > 0 {
-			options = append(options, transport.WithHTTPHeaders(v.Headers))
-		}
+		options := []transport.StreamableHTTPCOption{transport.WithHTTPHeaders(mcpHTTPHeaders(v.Headers))}
 		if v.Timeout > 0 {
 			options = append(options, transport.WithHTTPTimeout(v.Timeout))
 		}
