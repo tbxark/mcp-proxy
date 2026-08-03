@@ -17,6 +17,8 @@ func main() {
 	httpTimeout := flag.Int("http-timeout", 10, "HTTP timeout in seconds when fetching config from URL")
 	authorize := flag.String("authorize", "", "run a one-time interactive OAuth authorization for the named mcpServers entry, then exit. Opens a browser; run this by hand, not from the daemon/service.")
 	checkConfig := flag.Bool("check-config", false, "load and validate the config, then exit without starting the server")
+	authStatus := flag.Bool("auth-status", false, "list every configured MCP server with its transport and authentication state, then exit. Local-only: reads config.json and cached OAuth token expiry, makes no network calls.")
+	doctor := flag.Bool("doctor", false, "like -auth-status, but also connects to each remote server to confirm its credentials are accepted right now (may refresh an expired OAuth token via its refresh token; never opens a browser)")
 	var logLevel slog.Level
 	flag.TextVar(&logLevel, "log-level", slog.LevelInfo, "log level (debug, info, warn, error)")
 
@@ -35,6 +37,17 @@ func main() {
 	if *authorize != "" {
 		if err := runAuthorize(*conf, *authorize, *insecure, *expandEnv, *httpHeaders, *httpTimeout); err != nil {
 			slog.Error("Failed to authorize server", "server", *authorize, "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *authStatus || *doctor {
+		ok, err := runDoctor(*conf, *insecure, *expandEnv, *httpHeaders, *httpTimeout, *doctor)
+		if err != nil {
+			slog.Error("Failed to run doctor", "err", err)
+			os.Exit(1)
+		}
+		if !ok {
 			os.Exit(1)
 		}
 		return
