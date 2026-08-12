@@ -10,8 +10,8 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -106,6 +106,37 @@ func healthHandler(config *Config) http.HandlerFunc {
 	}
 }
 
+// connectAndMount runs a single server's connect/initialize sequence
+// against an already-built client and server pair and mounts its HTTP
+// route on httpMux either way: on success, the real proxying handler; on
+// failure, a serverRoute that retries lazily on each subsequent request
+// (see docs/OAUTH_LIFECYCLE.md and route.go) instead of requiring a
+// restart. The route always exists either way, so a request against it
+// always gets a clear answer instead of a bare 404. It's the per-server
+// body of the startup connect loop, factored out so the same sequence can
+// be re-run later for a single server without repeating the whole loop.
+//
+// Returns the serverRoute mounted on failure (nil on success) so the
+// caller can track it and, at shutdown, close its client if it ever
+// connects.
+func connectAndMount(ctx context.Context, name string, clientConfig *MCPClientConfigV2, proxyConfig *MCPProxyConfigV2, info mcp.Implementation, mcpClient *Client, srv *Server, baseURL *url.URL, httpMux *http.ServeMux) (*serverRoute, error) {
+	mcpRoute := routeForServer(baseURL, name)
+
+	slog.Info("Connecting", "client", name)
+	addErr := mcpClient.addToMCPServer(ctx, info, srv.mcpServer)
+	if addErr != nil {
+		slog.Error("Failed to add client to server", "client", name, "err", addErr)
+		slog.Info("Mounting not-ready route", "client", name, "route", mcpRoute)
+		route := newServerRoute(ctx, name, clientConfig, proxyConfig, info)
+		httpMux.Handle(mcpRoute, route)
+		return route, addErr
+	}
+	slog.Info("Connected", "client", name)
+	slog.Info("Handling requests", "client", name, "route", mcpRoute)
+	httpMux.Handle(mcpRoute, wrapHandler(name, clientConfig, srv))
+	return nil, nil
+}
+
 func startHTTPServer(config *Config) error {
 	baseURL, uErr := url.Parse(config.McpProxy.BaseURL)
 	if uErr != nil {
@@ -125,6 +156,8 @@ func startHTTPServer(config *Config) error {
 		Name: config.McpProxy.Name,
 	}
 	clients := make(map[string]*Client, len(config.McpServers))
+	var routesMu sync.Mutex
+	var routes []*serverRoute
 
 	// Unauthenticated health endpoints for liveness/readiness probes.
 	health := healthHandler(config)
@@ -146,34 +179,15 @@ func startHTTPServer(config *Config) error {
 		}
 		clients[name] = mcpClient
 		errorGroup.Go(func() error {
-			slog.Info("Connecting", "client", name)
-			addErr := mcpClient.addToMCPServer(ctx, info, server.mcpServer)
-			if addErr != nil {
-				slog.Error("Failed to add client to server", "client", name, "err", addErr)
-				if clientConfig.Options.PanicIfInvalid.OrElse(false) {
-					return addErr
-				}
-				return nil
+			route, connErr := connectAndMount(ctx, name, clientConfig, config.McpProxy, info, mcpClient, server, baseURL, httpMux)
+			if route != nil {
+				routesMu.Lock()
+				routes = append(routes, route)
+				routesMu.Unlock()
 			}
-			slog.Info("Connected", "client", name)
-
-			middlewares := make([]MiddlewareFunc, 0)
-			middlewares = append(middlewares, recoverMiddleware(name))
-			if clientConfig.Options.LogEnabled.OrElse(false) {
-				middlewares = append(middlewares, loggerMiddleware(name))
+			if connErr != nil && clientConfig.Options.PanicIfInvalid.OrElse(false) {
+				return connErr
 			}
-			if len(clientConfig.Options.AuthTokens) > 0 {
-				middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
-			}
-			mcpRoute := path.Join(baseURL.Path, name)
-			if !strings.HasPrefix(mcpRoute, "/") {
-				mcpRoute = "/" + mcpRoute
-			}
-			if !strings.HasSuffix(mcpRoute, "/") {
-				mcpRoute += "/"
-			}
-			slog.Info("Handling requests", "client", name, "route", mcpRoute)
-			httpMux.Handle(mcpRoute, chainMiddleware(server.handler, middlewares...))
 			return nil
 		})
 	}
@@ -209,6 +223,11 @@ func startHTTPServer(config *Config) error {
 			slog.Info("Shutting down", "client", name)
 			if err := client.Close(); err != nil {
 				shutdownErrors = append(shutdownErrors, fmt.Errorf("close client %q: %w", name, err))
+			}
+		}
+		for _, route := range routes {
+			if err := route.Close(); err != nil {
+				shutdownErrors = append(shutdownErrors, fmt.Errorf("close client %q: %w", route.name, err))
 			}
 		}
 		return errors.Join(shutdownErrors...)
