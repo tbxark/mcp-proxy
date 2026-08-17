@@ -116,6 +116,34 @@ Common fields:
 - `oauth` — for `sse` and `streamable-http` clients that require interactive OAuth instead of (or in addition to) `headers` (see below).
 - `options` — per‑server overrides and filters (see below).
 
+### Remote streamable HTTP example
+
+Use `transportType: "streamable-http"` for a hosted MCP server. This example
+connects Xquik, passes an API key as a bearer token, and applies a 30-second
+timeout. The default `-expand-env` behavior replaces `XQUIK_API_KEY`. Xquik
+exposes the `explore` and `xquik` tools.
+
+```jsonc
+{
+  "mcpServers": {
+    "xquik": {
+      "transportType": "streamable-http",
+      "url": "https://xquik.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${XQUIK_API_KEY}"
+      },
+      "timeout": "30s",
+      "options": {
+        "toolFilter": {
+          "mode": "allow",
+          "list": ["explore", "xquik"]
+        }
+      }
+    }
+  }
+}
+```
+
 ## oauth
 
 Some remote MCP servers (e.g. Notion's hosted MCP) require the full OAuth
@@ -171,7 +199,7 @@ looking, from the logs, like a refresh failure with no obvious cause.
 - `toolFilter` (object): Selectively expose tools to the proxy:
   - `mode`: `allow` or `block`.
   - `list`: List of tool names.
-- `Disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
+- `disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
 
 Notes:
 
