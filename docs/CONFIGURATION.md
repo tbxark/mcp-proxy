@@ -53,6 +53,7 @@ and the proxy's `globalAuthTokens` become `mcpProxy.options.authTokens`.
       // stdio client
       "command": "uvx",
       "args": ["mcp-server-fetch"],
+      "timeout": "60s", // bound each request so one wedged call cannot take the server down
       "options": {
         "panicIfInvalid": true,
         "logEnabled": false,
@@ -109,10 +110,16 @@ Common fields:
 
 - `command`, `args`, `env` — for `stdio` clients.
 - `url`, `headers` — for `sse` and `streamable-http` clients.
-- `timeout` — request timeout for `sse` and `streamable-http`. Write it as a
+- `timeout` — request timeout for a single downstream request. Write it as a
   duration string: `"timeout": "30s"`. A bare number means **nanoseconds**
   (`"timeout": 30` is 30ns, not 30 seconds), so anything under a millisecond is
-  rejected at startup rather than silently failing every request.
+  rejected at startup rather than silently failing every request — except on
+  `stdio`, where such a value is discarded and the server runs unbounded, so a
+  timeout copied in from a Claude config cannot break startup.
+  On `stdio` a timeout is worth setting: one pipe carries every request, so a
+  call the server accepts and never answers keeps that pipe busy, the keepalive
+  ping stops getting replies, and the whole downstream is dropped as unhealthy
+  for every caller until the proxy restarts.
 - `oauth` — for `sse` and `streamable-http` clients that require interactive OAuth instead of (or in addition to) `headers` (see below).
 - `options` — per‑server overrides and filters (see below).
 

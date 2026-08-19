@@ -35,6 +35,10 @@ const (
 	// watch readiness change instead of waiting half a minute.
 	testPingInterval = "200ms"
 	testGracePeriod  = "1s"
+	// testStdioTimeout bounds a single downstream stdio request. It is short so
+	// a wedged call fails fast in tests, but far longer than any fixture tool
+	// legitimately takes.
+	testStdioTimeout = "3s"
 )
 
 // configTemplate mirrors what a user would write by hand. The auth token comes
@@ -57,6 +61,7 @@ const configTemplate = `{
     "fixture": {
       "command": "%[3]s",
       "env": {"MCP_PROXY_TEST_ENV": "%[4]s"},
+      "timeout": "` + testStdioTimeout + `",
       "options": {
         "toolFilter": {"mode": "block", "list": ["blocked"]}
       }
