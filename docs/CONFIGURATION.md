@@ -66,6 +66,11 @@ and the proxy's `globalAuthTokens` become `mcpProxy.options.authTokens`.
         "disabled": true
       }
     },
+    "parallel-search": {
+      // Optional: sends search queries and requested URLs to Parallel.ai
+      "url": "https://search.parallel.ai/mcp",
+      "transportType": "streamable-http"
+    },
     "notion": {
       // streamable-http client requiring interactive OAuth (no static
       // bearer token accepted) - see "oauth" below
