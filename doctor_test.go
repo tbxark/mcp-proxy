@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 func TestCheckServerAuthStdio(t *testing.T) {
@@ -126,5 +131,59 @@ func TestRunDoctorSkipsDisabledServers(t *testing.T) {
 	}
 	if !ok {
 		t.Fatal("a disabled server should not fail the doctor check")
+	}
+}
+
+func TestDoctorUpdatesAuthStatusAfterTokenRefresh(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	mcpServer := server.NewStreamableHTTPServer(server.NewMCPServer("test", "1.0"))
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/metadata":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"issuer":                   "http://" + r.Host,
+				"authorization_endpoint":   "http://" + r.Host + "/authorize",
+				"token_endpoint":           "http://" + r.Host + "/token",
+				"response_types_supported": []string{"code"},
+			})
+		case "/token":
+			if r.PostFormValue("grant_type") != "refresh_token" || r.PostFormValue("refresh_token") != "refresh" {
+				http.Error(w, "unexpected refresh request", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"fresh","token_type":"Bearer","expires_in":3600}`))
+		default:
+			if r.Header.Get("Authorization") != "Bearer fresh" {
+				http.Error(w, "expired token", http.StatusUnauthorized)
+				return
+			}
+			mcpServer.ServeHTTP(w, r)
+		}
+	}))
+	defer remote.Close()
+	conf := &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           remote.URL + "/mcp",
+		OAuth:         &OAuthClientConfig{ClientID: "test", AuthServerMetadataURL: remote.URL + "/metadata"},
+	}
+	writeTestToken(t, "refreshable", &transport.Token{
+		AccessToken: "expired", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Hour),
+	})
+	res := checkServerAuth("refreshable", conf)
+	if res.ok || !strings.HasPrefix(res.status, "EXPIRED") {
+		t.Fatalf("expected expired token before live check, got %+v", res)
+	}
+	checkServerLive(&res, conf)
+	if res.live != "ok (connected)" || !res.ok || !strings.HasPrefix(res.status, "ok (expires in") {
+		t.Fatalf("expected refreshed auth status after live check, got %+v", res)
+	}
+
+	// A valid token must not hide a later connection failure.
+	remote.Close()
+	checkServerLive(&res, conf)
+	if res.ok || !strings.HasPrefix(res.live, "FAILED:") {
+		t.Fatalf("expected failed live check, got %+v", res)
 	}
 }
