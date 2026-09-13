@@ -368,7 +368,14 @@ func TestLoadInheritsProxyOptions(t *testing.T) {
 		t.Fatalf("load config: %v", err)
 	}
 
-	inherits := config.McpServers["inherits"].Options
+	inheritsServer := config.McpServers["inherits"]
+	if inheritsServer == nil {
+		t.Fatal("mcpServers[inherits] missing from loaded config")
+	}
+	inherits := inheritsServer.Options
+	if inherits == nil {
+		t.Fatal("mcpServers[inherits].options missing from loaded config")
+	}
 	if len(inherits.AuthTokens) != 1 || inherits.AuthTokens[0] != "shared" {
 		t.Errorf("inherited authTokens = %v, want [shared]", inherits.AuthTokens)
 	}
@@ -379,7 +386,11 @@ func TestLoadInheritsProxyOptions(t *testing.T) {
 		t.Errorf("inherited pingInterval = %v, want 5s", got)
 	}
 
-	overrides := config.McpServers["overrides"].Options
+	overridesServer := config.McpServers["overrides"]
+	if overridesServer == nil || overridesServer.Options == nil {
+		t.Fatal("mcpServers[overrides].options missing from loaded config")
+	}
+	overrides := overridesServer.Options
 	if len(overrides.AuthTokens) != 1 || overrides.AuthTokens[0] != "own" {
 		t.Errorf("overridden authTokens = %v, want [own]", overrides.AuthTokens)
 	}

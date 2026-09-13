@@ -149,3 +149,4 @@ config_prod.json
 /.grok/skills
 /.zcode/skills
 skills-lock.json
+/code_review

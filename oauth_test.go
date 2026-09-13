@@ -146,7 +146,7 @@ func TestOAuthCallbackServerFailsWhenAddressInUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve address: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	_, err = startOAuthCallbackServer(listener.Addr().String(), "/callback", "state", make(chan map[string]string, 1))
 	if err == nil {

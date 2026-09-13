@@ -67,7 +67,7 @@ func TestMCPHTTPClientRequestsUncompressedResponses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newMCPClient: %v", err)
 	}
-	defer mcpClient.Close()
+	defer func() { _ = mcpClient.Close() }()
 
 	ctx := t.Context()
 	if err := mcpClient.client.Start(ctx); err != nil {

@@ -155,7 +155,7 @@ func TestStartHTTPServerReturnsListenError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve address: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	config := &Config{
 		McpProxy: &MCPProxyConfigV2{

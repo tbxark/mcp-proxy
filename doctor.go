@@ -5,8 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"text/tabwriter"
@@ -36,8 +37,7 @@ type doctorResult struct {
 //
 // With live=false (-auth-status) this is local-only: it reads config.json
 // and the cached oauth/<name>.json token files (comparing expires_at
-// against now), the same fields AGENTS.md already documents checking by
-// hand. With live=true (-doctor) it additionally connects to each remote
+// against now). With live=true (-doctor) it additionally connects to each remote
 // server (the same Start+Initialize the daemon performs at startup, run
 // concurrently across servers) to confirm the credentials are accepted
 // right now rather than just unexpired locally; this can incidentally
@@ -52,11 +52,7 @@ func runDoctor(configPath string, insecure, expandEnv bool, httpHeaders string, 
 		return false, fmt.Errorf("failed to load config: %w", err)
 	}
 
-	names := make([]string, 0, len(config.McpServers))
-	for name := range config.McpServers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	names := slices.Sorted(maps.Keys(config.McpServers))
 
 	results := make([]doctorResult, len(names))
 	for i, name := range names {
@@ -67,24 +63,21 @@ func runDoctor(configPath string, insecure, expandEnv bool, httpHeaders string, 
 		var wg sync.WaitGroup
 		for i, name := range names {
 			clientConfig := config.McpServers[name]
-			if results[i].transport == "stdio" || (clientConfig.Options != nil && clientConfig.Options.Disabled) {
+			if clientConfig == nil || results[i].transport == "stdio" || (clientConfig.Options != nil && clientConfig.Options.Disabled) {
 				continue
 			}
-			wg.Add(1)
-			go func(i int, name string, clientConfig *MCPClientConfigV2) {
-				defer wg.Done()
+			wg.Go(func() {
 				slog.Info("doctor: checking live", "server", name)
 				checkServerLive(&results[i], clientConfig)
 				slog.Info("doctor: checked live", "server", name, "result", results[i].live)
-			}(i, name, clientConfig)
+			})
 		}
 		wg.Wait()
 	}
 
 	allOK := true
 	for i, name := range names {
-		clientConfig := config.McpServers[name]
-		if clientConfig.Options != nil && clientConfig.Options.Disabled {
+		if clientConfig := config.McpServers[name]; clientConfig != nil && clientConfig.Options != nil && clientConfig.Options.Disabled {
 			results[i].status = "disabled (skipped)"
 			results[i].ok = true
 		}
@@ -154,7 +147,7 @@ func checkStaticHeaders(res *doctorResult, headers map[string]string) {
 		}
 	}
 	if len(empty) > 0 {
-		sort.Strings(empty)
+		slices.Sort(empty)
 		res.ok = false
 		res.status = fmt.Sprintf("MISSING (%s empty after env expansion; check the referenced env var is set)", strings.Join(empty, ", "))
 		return
@@ -209,7 +202,7 @@ func checkServerLive(res *doctorResult, conf *MCPClientConfigV2) {
 		res.live = fmt.Sprintf("FAILED: %v", err)
 		return
 	}
-	defer mcpClient.Close()
+	defer func() { _ = mcpClient.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), doctorLiveTimeout)
 	defer cancel()
@@ -243,9 +236,9 @@ func liveFailureMessage(name string, err error) string {
 func printDoctorReport(results []doctorResult, live bool) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	if live {
-		fmt.Fprintln(w, "NAME\tTRANSPORT\tAUTH\tSTATUS\tLIVE")
+		_, _ = fmt.Fprintln(w, "NAME\tTRANSPORT\tAUTH\tSTATUS\tLIVE")
 	} else {
-		fmt.Fprintln(w, "NAME\tTRANSPORT\tAUTH\tSTATUS")
+		_, _ = fmt.Fprintln(w, "NAME\tTRANSPORT\tAUTH\tSTATUS")
 	}
 	for _, res := range results {
 		if live {
@@ -253,9 +246,9 @@ func printDoctorReport(results []doctorResult, live bool) {
 			if liveStatus == "" {
 				liveStatus = "skipped"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", res.name, res.transport, res.auth, res.status, liveStatus)
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", res.name, res.transport, res.auth, res.status, liveStatus)
 		} else {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", res.name, res.transport, res.auth, res.status)
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", res.name, res.transport, res.auth, res.status)
 		}
 	}
 	_ = w.Flush()

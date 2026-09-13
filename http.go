@@ -29,8 +29,8 @@ type MiddlewareFunc func(http.Handler) http.Handler
 // first one is outermost and sees every request, including those the ones
 // after it reject or panic on.
 func chainMiddleware(h http.Handler, middlewares ...MiddlewareFunc) http.Handler {
-	for i := len(middlewares) - 1; i >= 0; i-- {
-		h = middlewares[i](h)
+	for _, middleware := range slices.Backward(middlewares) {
+		h = middleware(h)
 	}
 	return h
 }
@@ -144,6 +144,8 @@ func healthHandler(config *Config, readiness func() readinessReport) http.Handle
 				code, resp.Status = http.StatusServiceUnavailable, "unavailable"
 			}
 		}
+		// Registered under a "GET" pattern, so ServeMux answers 405 (with Allow)
+		// for every other method before this runs. GET patterns match HEAD too.
 		switch r.Method {
 		case http.MethodGet:
 			w.Header().Set("Content-Type", "application/json")
@@ -151,8 +153,6 @@ func healthHandler(config *Config, readiness func() readinessReport) http.Handle
 			_ = json.NewEncoder(w).Encode(resp)
 		case http.MethodHead:
 			w.WriteHeader(code)
-		default:
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		}
 	}
 }
@@ -233,8 +233,8 @@ func startHTTPServer(config *Config) error {
 		slices.Sort(report.unhealthy)
 		return report
 	}
-	httpMux.HandleFunc("/_healthz", healthHandler(config, nil))
-	httpMux.HandleFunc("/_readyz", healthHandler(config, readiness))
+	httpMux.HandleFunc("GET /_healthz", healthHandler(config, nil))
+	httpMux.HandleFunc("GET /_readyz", healthHandler(config, readiness))
 
 	for name, clientConfig := range config.McpServers {
 		if clientConfig.Options.Disabled {

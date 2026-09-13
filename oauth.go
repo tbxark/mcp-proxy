@@ -112,7 +112,7 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 	if err != nil {
 		return fmt.Errorf("failed to create client: %w", err)
 	}
-	defer mcpClient.Close()
+	defer func() { _ = mcpClient.Close() }()
 
 	redirectURI := oauthConf.RedirectURI
 	if redirectURI == "" {
@@ -176,7 +176,7 @@ func authorizeInteractively(ctx context.Context, err error, serverName, redirect
 	if err != nil {
 		return fmt.Errorf("failed to start OAuth callback server: %w", err)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 
 	if oauthHandler.GetClientID() == "" {
 		if err := oauthHandler.RegisterClient(ctx, "mcp-proxy ("+serverName+")"); err != nil {

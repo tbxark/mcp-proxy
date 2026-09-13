@@ -224,7 +224,10 @@ func (c *Client) probe(ctx context.Context) error {
 		_, err := c.client.ListTools(ctx, mcp.ListToolsRequest{})
 		return err
 	}
-	return c.client.Ping(ctx)
+	// Ping is deprecated because it is a no-op on modern connections - which is
+	// exactly why probe() only reaches it on legacy ones. There is no
+	// replacement liveness call for servers older than 2026-07-28.
+	return c.client.Ping(ctx) //nolint:staticcheck // intentional legacy fallback, see above
 }
 
 // pingFailureThreshold is how many probes in a row have to fail before the

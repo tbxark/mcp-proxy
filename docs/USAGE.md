@@ -47,10 +47,12 @@ Two unauthenticated endpoints are always served for liveness/readiness probes
 - `/_readyz` (readiness) returns `503` with `"status":"initializing"` until every
   enabled server has finished connecting and mounting its route, then `200`.
 - `/_readyz` returns `503` again with `"status":"degraded"` if a downstream that
-  had connected later stops answering: each connection is pinged every 30s, and
-  the servers that failed are listed in `unhealthy`. It takes three failed pings
-  in a row, so a busy single-threaded server that skips one ping does not take
-  the proxy out of rotation.
+  had connected later stops answering: each connection is probed every 30s, and
+  the servers that failed are listed in `unhealthy`. It takes three failed probes
+  in a row, so a busy single-threaded server that misses one probe does not take
+  the proxy out of rotation. Servers speaking the modern protocol (2026-07-28,
+  which removed ping) are probed with a real `tools/list` request; legacy
+  connections are still pinged.
 - `/_readyz` returns `503` with `"status":"unavailable"` if no enabled server is
   mounted at all. Nothing can be named as broken in that case, but every MCP
   route would `404`.

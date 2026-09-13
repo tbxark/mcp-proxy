@@ -247,3 +247,31 @@ func TestRemoteServerHealthDegrades(t *testing.T) {
 		t.Errorf("/_readyz body = %s, want the remote server named", body)
 	}
 }
+
+// The keepalive probe has two eras: a modern connection is probed with a real
+// tools/list because 2026-07-28 removed ping, while a legacy connection is
+// still pinged. SSE has no server/discover, so the proxy settles that
+// connection on the legacy handshake - the ping branch the streamable-http
+// degradation test above cannot reach.
+func TestSSERemoteServerHealthDegrades(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	downstreamURL, _, downstream := startDownstreamMCP(t, "sse")
+	configPath, addr := remoteConfig(t, "sse", downstreamURL)
+	proxy := startProxy(t, configPath, addr)
+
+	if code, body := proxy.ready(t); code != http.StatusOK {
+		t.Fatalf("/_readyz = %d %s while the SSE downstream is healthy", code, body)
+	}
+
+	// CloseClientConnections first so in-flight keepalives fail immediately
+	// rather than hanging on a half-open socket.
+	downstream.CloseClientConnections()
+	downstream.Close()
+
+	body := proxy.waitForReadyState(t, http.StatusServiceUnavailable)
+	if !strings.Contains(body, `"unhealthy":["remote"]`) {
+		t.Errorf("/_readyz body = %s, want the remote server named", body)
+	}
+}
