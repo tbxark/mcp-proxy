@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -39,6 +40,11 @@ type Client struct {
 	client          *client.Client
 	options         *OptionsV2
 	health          atomic.Int32
+	// requestTimeout bounds one forwarded request. It is only set for stdio
+	// downstreams: the sse and streamable-http clients carry their timeout
+	// inside the transport, but the stdio transport has no equivalent, so the
+	// bound has to be applied to the context of each call instead.
+	requestTimeout time.Duration
 }
 
 func (c *Client) Health() clientHealth {
@@ -95,14 +101,16 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 		if err != nil {
 			return nil, err
 		}
+		drainStderr(name, mcpClient)
 
 		// Stdio servers are pinged too: a crashed subprocess is the most
 		// common way a downstream disappears at runtime.
 		return &Client{
-			name:     name,
-			needPing: true,
-			client:   mcpClient,
-			options:  conf.Options,
+			name:           name,
+			needPing:       true,
+			client:         mcpClient,
+			options:        conf.Options,
+			requestTimeout: time.Duration(v.Timeout),
 		}, nil
 	case *SSEMCPClientConfig:
 		if v.OAuth != nil {
@@ -204,6 +212,55 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 		go c.startPingTask(ctx)
 	}
 	return nil
+}
+
+// callTool forwards a tool call to the downstream, bounded by requestTimeout
+// when one is configured.
+//
+// The bound matters most for stdio: a stdio downstream shares one pipe for
+// every request, so a call the server accepts but never answers keeps that pipe
+// occupied. The keepalive ping then gets no reply either, and after
+// pingFailureThreshold probes the client is marked unhealthy and stays there —
+// the whole downstream is lost to every caller, not just the one that made the
+// wedging call. sse and streamable-http already bound this inside their
+// transports, so requestTimeout is left zero for them and the caller's context
+// is forwarded unchanged.
+func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if c.requestTimeout <= 0 {
+		return c.client.CallTool(ctx, request)
+	}
+	callCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
+	defer cancel()
+	return c.client.CallTool(callCtx, request)
+}
+
+// drainStderr keeps reading a stdio subprocess's stderr for as long as it runs.
+//
+// Start() hands the subprocess a StderrPipe that nothing consumes: mcp-go only
+// exposes it through Stderr(). An OS pipe holds roughly 64KB, so a downstream
+// that logs to stderr — most of them do — works until that buffer fills and then
+// blocks inside write(2) forever. Nothing reports an error, because from here
+// the server has simply gone silent: one stdio channel carries every request, so
+// the keepalive ping stops being answered too and the client is marked unhealthy
+// for every caller until the proxy restarts.
+//
+// The lines are logged rather than discarded, since a downstream's stderr is
+// usually where it explains why it is unhappy.
+func drainStderr(name string, mcpClient *client.Client) {
+	stderr, ok := client.GetStderr(mcpClient)
+	if !ok || stderr == nil {
+		return
+	}
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		// Downstream servers can emit long single lines (a Python traceback
+		// frame, a serialized payload); the default 64KB token limit would turn
+		// one into a scan error and stop the drain.
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			slog.Debug("Downstream stderr", "client", name, "line", scanner.Text())
+		}
+	}()
 }
 
 // pingTimeout bounds a single probe, so a downstream that accepts the request
@@ -331,7 +388,7 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 		for _, tool := range tools.Tools {
 			if filterFunc(tool.Name) {
 				slog.Debug("Adding tool", "client", c.name, "tool", tool.Name)
-				mcpServer.AddTool(tool, c.client.CallTool)
+				mcpServer.AddTool(tool, c.callTool)
 			}
 		}
 		if tools.NextCursor == "" {

@@ -48,9 +48,11 @@ func TestParseMCPClientConfigV2(t *testing.T) {
 		{name: "stdio missing command", config: &MCPClientConfigV2{TransportType: MCPClientTypeStdio}, wantErr: "command is required"},
 		{name: "oauth on stdio", config: &MCPClientConfigV2{Command: "server", OAuth: &OAuthClientConfig{}}, wantErr: "oauth is not supported"},
 		{name: "negative timeout", config: &MCPClientConfigV2{TransportType: MCPClientTypeStreamable, URL: "https://example.com", Timeout: -1}, wantErr: "timeout cannot be negative"},
-		// stdio has no timeout field, so a stray one copied in from a Claude
-		// config is discarded rather than failing the whole proxy's startup.
-		{name: "stdio ignores timeout", config: &MCPClientConfigV2{Command: "server", Timeout: 30}, want: &StdioMCPClientConfig{}},
+		// A stray sub-millisecond timeout copied in from a Claude config (where
+		// a bare number means nanoseconds) is discarded rather than failing the
+		// whole proxy's startup. A usable one is kept and bounds each request.
+		{name: "stdio ignores unusable timeout", config: &MCPClientConfigV2{Command: "server", Timeout: 30}, want: &StdioMCPClientConfig{}},
+		{name: "stdio keeps usable timeout", config: &MCPClientConfigV2{Command: "server", Timeout: Duration(30 * time.Second)}, want: &StdioMCPClientConfig{Timeout: Duration(30 * time.Second)}},
 	}
 
 	for _, tt := range tests {
@@ -67,8 +69,12 @@ func TestParseMCPClientConfigV2(t *testing.T) {
 			}
 			switch tt.want.(type) {
 			case *StdioMCPClientConfig:
-				if _, ok := got.(*StdioMCPClientConfig); !ok {
+				stdio, ok := got.(*StdioMCPClientConfig)
+				if !ok {
 					t.Fatalf("type = %T, want *StdioMCPClientConfig", got)
+				}
+				if want := tt.want.(*StdioMCPClientConfig); stdio.Timeout != want.Timeout {
+					t.Errorf("Timeout = %v, want %v", time.Duration(stdio.Timeout), time.Duration(want.Timeout))
 				}
 			case *SSEMCPClientConfig:
 				if _, ok := got.(*SSEMCPClientConfig); !ok {

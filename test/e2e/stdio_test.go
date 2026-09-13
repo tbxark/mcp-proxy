@@ -129,10 +129,10 @@ func checkTools(t *testing.T, mcpClient *client.Client) {
 		names = append(names, tool.Name)
 	}
 	slices.Sort(names)
-	// The fixture registers six tools and serves them two per page, so a
+	// The fixture registers eight tools and serves them two per page, so a
 	// complete list proves both that the block filter dropped "blocked" and
 	// that multi-page listing works end to end.
-	want := []string{"add", "echo", "fail", "getenv", "pid"}
+	want := []string{"add", "echo", "fail", "getenv", "hang", "noisy_stderr", "pid"}
 	if !slices.Equal(names, want) {
 		t.Fatalf("tools = %v, want %v (blocked tool filtered, all pages fetched)", names, want)
 	}

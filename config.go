@@ -59,6 +59,7 @@ type StdioMCPClientConfig struct {
 	Command string            `json:"command"`
 	Env     map[string]string `json:"env"`
 	Args    []string          `json:"args"`
+	Timeout Duration          `json:"timeout"`
 }
 
 type SSEMCPClientConfig struct {
@@ -227,10 +228,19 @@ func parseMCPClientConfigV2(conf *MCPClientConfigV2) (any, error) {
 		if conf.OAuth != nil {
 			return nil, errors.New("oauth is not supported for stdio transport")
 		}
+		// A sub-millisecond timeout is almost always a bare number copied in
+		// from a Claude config, where it means nanoseconds. Such a value is
+		// discarded rather than failing startup — the historical behaviour for
+		// stdio — but a usable one now bounds each request.
+		stdioTimeout := conf.Timeout
+		if err := validateDuration("timeout", stdioTimeout); err != nil {
+			stdioTimeout = 0
+		}
 		return &StdioMCPClientConfig{
 			Command: conf.Command,
 			Env:     conf.Env,
 			Args:    conf.Args,
+			Timeout: stdioTimeout,
 		}, nil
 	case MCPClientTypeSSE:
 		if conf.URL == "" {

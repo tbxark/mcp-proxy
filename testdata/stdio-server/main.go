@@ -81,6 +81,43 @@ func addTools(s *server.MCPServer) {
 		},
 	)
 
+	// hang accepts the request and then never answers, which is what a
+	// single-threaded stdio server looks like when a tool call wedges. The
+	// proxy must bound the wait itself; the client cannot, because a stdio
+	// downstream has no transport-level deadline of its own.
+	s.AddTool(
+		mcp.NewTool("hang",
+			mcp.WithDescription("Accept the call and never respond"),
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	)
+
+	// noisy_stderr writes more than one pipe buffer's worth of stderr in a
+	// single call. Nothing reads a stdio subprocess's stderr, so once the pipe
+	// fills, write(2) blocks and the server stops answering entirely.
+	s.AddTool(
+		mcp.NewTool("noisy_stderr",
+			mcp.WithDescription("Write the given number of kilobytes to stderr"),
+			mcp.WithNumber("kilobytes", mcp.Required()),
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			kb, err := request.RequireFloat("kilobytes")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			line := strings.Repeat("x", 1023) + "\n"
+			for range int(kb) {
+				if _, err := os.Stderr.WriteString(line); err != nil {
+					return mcp.NewToolResultError(err.Error()), nil
+				}
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("wrote %dKB to stderr", int(kb))), nil
+		},
+	)
+
 	// getenv reports a variable from this process's environment, so the test can
 	// confirm mcpServers.<name>.env reached the subprocess.
 	s.AddTool(
