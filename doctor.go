@@ -223,6 +223,8 @@ func checkServerLive(res *doctorResult, conf *MCPClientConfigV2) {
 		res.live = liveFailureMessage(res.name, err)
 		return
 	}
+	// Initialization may have refreshed the persisted OAuth token.
+	*res = checkServerAuth(res.name, conf)
 	res.live = "ok (connected)"
 }
 
