@@ -144,3 +144,8 @@ fabric.properties
 /build
 /dist
 config_prod.json
+/.agents/skills
+/.claude/skills
+/.grok/skills
+/.zcode/skills
+skills-lock.json

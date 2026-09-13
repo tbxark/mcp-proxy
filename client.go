@@ -210,6 +210,23 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 // and then stalls cannot block the health loop until shutdown.
 const pingTimeout = 10 * time.Second
 
+// probe liveness of a downstream connection. Protocol version 2026-07-28
+// removed ping: the stateless protocol core has no connection to keep alive,
+// and mcp-go's client answers its Ping with an immediate nil on a modern
+// connection, which would make every probe look healthy. A real request
+// doubles as the probe there. The failure classification is unchanged: a
+// transport error means the connection is broken, while a JSON-RPC error
+// response is proof the downstream answered and is therefore alive. ListTools
+// is the one call every mounted client already answered during startup, so it
+// works for both protocol eras.
+func (c *Client) probe(ctx context.Context) error {
+	if mcp.IsModernProtocol(c.client.ProtocolVersion()) {
+		_, err := c.client.ListTools(ctx, mcp.ListToolsRequest{})
+		return err
+	}
+	return c.client.Ping(ctx)
+}
+
 // pingFailureThreshold is how many probes in a row have to fail before the
 // connection counts as broken. One is not enough: a single-threaded downstream
 // (the common shape for Python and Node stdio servers) busy with a long tool
@@ -237,24 +254,24 @@ func (c *Client) startPingTask(ctx context.Context) {
 			return
 		case <-ticker.C:
 			pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
-			err := c.client.Ping(pingCtx)
+			err := c.probe(pingCtx)
 			cancel()
 			if ctx.Err() != nil {
 				return
 			}
 			if err != nil && isTransportFailure(err) {
 				failCount++
-				slog.Warn("MCP ping failed", "client", c.name, "err", err, "failures", failCount)
+				slog.Warn("MCP health probe failed", "client", c.name, "err", err, "failures", failCount)
 				if failCount >= pingFailureThreshold {
 					c.health.Store(int32(healthFailed))
 				}
 				continue
 			}
 			if err != nil {
-				slog.Debug("MCP ping answered with an error, treating as alive", "client", c.name, "err", err)
+				slog.Debug("MCP health probe answered with an error, treating as alive", "client", c.name, "err", err)
 			}
 			if failCount > 0 {
-				slog.Info("MCP ping recovered", "client", c.name, "failures", failCount)
+				slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
 				failCount = 0
 			}
 			c.health.Store(int32(healthOK))
