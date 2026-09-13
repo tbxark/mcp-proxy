@@ -66,7 +66,7 @@
     </div>
     <div class="row mb-5">
         <div class="col-12 text-center">
-            <p class="lead">Convert the configuration of <strong>mcp-proxy</strong> to the configuration for Claude.</p>
+            <p class="lead">Convert the configuration of <strong>mcp-proxy</strong> to the configuration for Claude Code / Codex.</p>
         </div>
     </div>
     <div class="row converter-container">
@@ -86,11 +86,15 @@
         </div>
         <div class="col-md-6">
             <div class="card h-100">
-                <div class="card-header bg-warning text-white">
-                    <h5 class="mb-0">Claude</h5>
+                <div class="card-header bg-warning text-white d-flex align-items-center justify-content-between">
+                    <h5 class="mb-0" id="targetTitle">Claude Code</h5>
+                    <div class="btn-group btn-group-sm" id="targetSwitch" role="group" aria-label="Target client">
+                        <button type="button" class="btn btn-dark active" data-target="claude-code">Claude Code</button>
+                        <button type="button" class="btn btn-outline-dark" data-target="codex">Codex</button>
+                    </div>
                 </div>
                 <div class="card-body">
-                    <textarea id="claudeConfig" class="form-control config-area"
+                    <textarea id="targetConfig" class="form-control config-area"
                               placeholder="The configuration of the converted version will be displayed here...."
                               readonly></textarea>
                 </div>
@@ -164,57 +168,113 @@
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
+    const targetConfigEl = document.getElementById('targetConfig');
+    const fromConfigEl = document.getElementById('fromConfig');
+    let currentTarget = 'claude-code';
+
+    function updateTargetSwitch() {
+        document.querySelectorAll('#targetSwitch [data-target]').forEach(btn => {
+            const active = btn.dataset.target === currentTarget;
+            btn.classList.toggle('active', active);
+            btn.classList.toggle('btn-dark', active);
+            btn.classList.toggle('btn-outline-dark', !active);
+        });
+        document.getElementById('targetTitle').textContent = currentTarget === 'codex' ? 'Codex' : 'Claude Code';
+    }
+
+    function updateOutput() {
+        const fromConfig = JSON.parse(fromConfigEl.value);
+        targetConfigEl.value = currentTarget === 'codex'
+            ? convertToCodex(fromConfig)
+            : JSON.stringify(convertToClaudeCode(fromConfig), null, 2);
+    }
+
+    document.querySelectorAll('#targetSwitch [data-target]').forEach(btn => {
+        btn.addEventListener('click', function () {
+            if (currentTarget === this.dataset.target) return;
+            currentTarget = this.dataset.target;
+            updateTargetSwitch();
+            try {
+                updateOutput();
+            } catch (e) {
+                // keep the previous output when the source config is not valid JSON yet
+            }
+        });
+    });
+
     document.getElementById('convertBtn').addEventListener('click', function () {
         try {
-            const fromConfig = JSON.parse(document.getElementById('fromConfig').value);
-            const claudeConfig = convertConfig(fromConfig);
-            document.getElementById('claudeConfig').value = JSON.stringify(claudeConfig, null, 2);
+            updateOutput();
         } catch (e) {
             alert('Configuration conversion failed:' + e.message);
         }
     });
 
     document.getElementById('copyBtn').addEventListener('click', function () {
-        const claudeConfig = document.getElementById('claudeConfig');
-        claudeConfig.select();
+        targetConfigEl.select();
         document.execCommand('copy');
         alert('Configuration has been copied to the clipboard.');
     });
 
-    function convertConfig(fromConfig) {
-        const claudeConfig = {
-            mcpServers: {}
-        };
+    function collectServers(fromConfig) {
         const options = fromConfig?.mcpProxy?.options ?? {};
         const baseURL = fromConfig?.mcpProxy?.baseURL;
         const mcpServers = fromConfig?.mcpServers ?? {};
         if (!baseURL || !isValidUrl(baseURL)) {
-            console.error('Invalid or missing baseURL in mcpProxy configuration');
-            return claudeConfig;
+            throw new Error('Invalid or missing baseURL in mcpProxy configuration');
         }
-        try {
-            const baseUrlObj = new URL(baseURL);
-            const suffix = fromConfig?.mcpProxy?.type === 'streamable-http' ? 'mcp' : 'sse';
-            for (const key of Object.keys(mcpServers)) {
-                const url = new URL(baseUrlObj);
-                url.pathname = `${url.pathname.replace(/\/+$/, '')}/${key}/${suffix}`.replace(/\/+/g, '/');
-                const server = {
-                    url: url.toString()
+        const baseUrlObj = new URL(baseURL);
+        const suffix = fromConfig?.mcpProxy?.type === 'streamable-http' ? 'mcp' : 'sse';
+        const servers = [];
+        for (const key of Object.keys(mcpServers)) {
+            const url = new URL(baseUrlObj);
+            url.pathname = `${url.pathname.replace(/\/+$/, '')}/${key}/${suffix}`.replace(/\/+/g, '/');
+            const token = mcpServers[key]?.options?.authTokens?.[0] ?? options?.authTokens?.[0];
+            servers.push({key, url: url.toString(), token, suffix});
+        }
+        return servers;
+    }
+
+    function convertToClaudeCode(fromConfig) {
+        const config = {
+            mcpServers: {}
+        };
+        for (const server of collectServers(fromConfig)) {
+            const target = {
+                type: server.suffix === 'mcp' ? 'http' : 'sse',
+                url: server.url
+            };
+            if (server.token) {
+                target.headers = {
+                    Authorization: server.token
                 };
-                const token = mcpServers[key]?.options?.authTokens?.[0] ?? options?.authTokens?.[0];
-                if (token) {
-                    server.headers = {
-                        Authorization: token
-                    };
-                }
-
-                claudeConfig.mcpServers[key] = server;
             }
-        } catch (error) {
-            console.error('Error processing URL configuration:', error);
+            config.mcpServers[server.key] = target;
         }
+        return config;
+    }
 
-        return claudeConfig;
+    function convertToCodex(fromConfig) {
+        const lines = [];
+        for (const server of collectServers(fromConfig)) {
+            lines.push(`[mcp_servers.${tomlKey(server.key)}]`);
+            lines.push(`url = ${tomlString(server.url)}`);
+            if (server.token) {
+                lines.push('');
+                lines.push(`[mcp_servers.${tomlKey(server.key)}.http_headers]`);
+                lines.push(`Authorization = ${tomlString(server.token)}`);
+            }
+            lines.push('');
+        }
+        return lines.join('\n').trimEnd() + '\n';
+    }
+
+    function tomlKey(key) {
+        return /^[A-Za-z0-9_-]+$/.test(key) ? key : JSON.stringify(key);
+    }
+
+    function tomlString(value) {
+        return JSON.stringify(value);
     }
 
     function isValidUrl(urlString) {
@@ -228,9 +288,8 @@
 
     async function main() {
         const fromConfig = await fetch("https://raw.githubusercontent.com/TBXark/mcp-proxy/refs/heads/master/config.json").then(r => r.text())
-        document.getElementById('fromConfig').value = fromConfig;
-        const claudeConfig = convertConfig(JSON.parse(fromConfig));
-        document.getElementById('claudeConfig').value = JSON.stringify(claudeConfig, null, 2);
+        fromConfigEl.value = fromConfig;
+        updateOutput();
     }
 
     main().catch(console.error);
