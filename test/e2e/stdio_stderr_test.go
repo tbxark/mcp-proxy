@@ -41,11 +41,13 @@ func TestStdioStderrDoesNotDeadlock(t *testing.T) {
 		t.Fatalf("CallTool(noisy_stderr): %v; the subprocess is wedged writing to an unread stderr pipe", err)
 	}
 
-	// The channel must still be usable afterwards.
-	pingCtx, pingCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer pingCancel()
-	if err := mcpClient.Ping(pingCtx); err != nil {
-		t.Fatalf("Ping after heavy stderr output: %v", err)
+	// The channel must still be usable afterwards. ListTools is a real
+	// round-trip; Ping would not be one, since the protocol removed it and a
+	// modern client answers it without sending anything.
+	listCtx, listCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer listCancel()
+	if _, err := mcpClient.ListTools(listCtx, mcp.ListToolsRequest{}); err != nil {
+		t.Fatalf("ListTools after heavy stderr output: %v", err)
 	}
 
 	echoCtx, echoCancel := context.WithTimeout(context.Background(), 15*time.Second)

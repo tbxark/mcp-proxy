@@ -49,13 +49,9 @@ func TestStdioToolCallIsBounded(t *testing.T) {
 
 	// The point of the bound: the server survives. A wedged stdio channel takes
 	// out every later call, which is the difference between one failed request
-	// and an outage for all clients of this downstream.
-	pingCtx, pingCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer pingCancel()
-	if err := mcpClient.Ping(pingCtx); err != nil {
-		t.Fatalf("Ping after a hung tool call: %v; the stdio channel is still wedged", err)
-	}
-
+	// and an outage for all clients of this downstream. ListTools is a real
+	// round-trip; Ping would not be one, since the protocol removed it and a
+	// modern client answers it without sending anything.
 	listCtx, listCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer listCancel()
 	if _, err := mcpClient.ListTools(listCtx, mcp.ListToolsRequest{}); err != nil {
