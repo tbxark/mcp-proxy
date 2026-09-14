@@ -71,6 +71,14 @@ A server that never connected at startup is *not* reported as unhealthy: it has
 no route, and keeping the whole proxy out of rotation would take the working
 servers down with it. Use `-doctor` or the startup logs to find those.
 
+By default a server that is down at startup stays down until the proxy is
+restarted, and a connection that drops stays `degraded`. Set `autoReconnect: true`
+on a server (or in `mcpProxy.options` for all of them) to have it repair itself:
+the proxy retries an unreachable backend every `reconnectInterval` (default `15s`)
+and mounts its route once it connects, and it rebuilds a connection that drops.
+This trades the external-restart contract for in-process recovery, which suits a
+host where the proxy outlives the app it fronts (e.g. started at login).
+
 These endpoints never require the proxy auth token, which also means the
 `unhealthy` list exposes your server names to anyone who can reach the port.
 Bind the proxy to an internal address, or keep the health endpoints on an

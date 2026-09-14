@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,7 +38,6 @@ type Client struct {
 	name            string
 	needPing        bool
 	needManualStart bool
-	client          *client.Client
 	options         *OptionsV2
 	health          atomic.Int32
 	// requestTimeout bounds one forwarded request. It is only set for stdio
@@ -45,6 +45,29 @@ type Client struct {
 	// inside the transport, but the stdio transport has no equivalent, so the
 	// bound has to be applied to the context of each call instead.
 	requestTimeout time.Duration
+
+	// clientConf is the parsed transport config. It is kept so a dropped
+	// downstream can be rebuilt from scratch instead of reusing a dead client.
+	clientConf any
+
+	// mu guards client. Forwarded calls resolve the live connection through
+	// getClient at request time, so reconnecting can swap it under them.
+	mu     sync.RWMutex
+	client *client.Client
+
+	// connectMu serializes connect attempts: the startup retry loop and the
+	// ping-driven reconnect must never build a transport at the same time.
+	connectMu sync.Mutex
+	// hasConnected is false until the first connect succeeds. Until then the
+	// transport built in newMCPClient is reused (stdio spawns its subprocess
+	// there); afterwards every attempt rebuilds, so a dead one is never reused.
+	hasConnected bool
+	closed       atomic.Bool
+
+	// remembered from the last addToMCPServer so the ping task can reconnect.
+	clientInfo mcp.Implementation
+	mcpServer  *server.MCPServer
+	pingOnce   sync.Once
 }
 
 func (c *Client) Health() clientHealth {
@@ -91,100 +114,132 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 	if pErr != nil {
 		return nil, pErr
 	}
+	c := &Client{
+		name:       name,
+		options:    conf.Options,
+		clientConf: clientInfo,
+	}
 	switch v := clientInfo.(type) {
+	case *StdioMCPClientConfig:
+		// Stdio servers are pinged too: a crashed subprocess is the most
+		// common way a downstream disappears at runtime.
+		c.needPing = true
+		c.requestTimeout = time.Duration(v.Timeout)
+	case *SSEMCPClientConfig, *StreamableMCPClientConfig:
+		c.needPing = true
+		c.needManualStart = true
+	}
+	// The first transport is built here: for stdio that spawns the subprocess,
+	// so a missing command fails at startup rather than on first use.
+	raw, err := c.buildRawClient()
+	if err != nil {
+		return nil, err
+	}
+	c.client = raw
+	return c, nil
+}
+
+// buildRawClient creates a fresh underlying transport from the stored config.
+// It is called once at construction and again on every reconnect, so a dead
+// backend (closed Obsidian, crashed stdio server) is replaced rather than
+// reused.
+func (c *Client) buildRawClient() (*client.Client, error) {
+	switch v := c.clientConf.(type) {
 	case *StdioMCPClientConfig:
 		envs := make([]string, 0, len(v.Env))
 		for kk, vv := range v.Env {
 			envs = append(envs, fmt.Sprintf("%s=%s", kk, vv))
 		}
-		mcpClient, err := client.NewStdioMCPClient(v.Command, envs, v.Args...)
+		raw, err := client.NewStdioMCPClient(v.Command, envs, v.Args...)
 		if err != nil {
 			return nil, err
 		}
-		drainStderr(name, mcpClient)
-
-		// Stdio servers are pinged too: a crashed subprocess is the most
-		// common way a downstream disappears at runtime.
-		return &Client{
-			name:           name,
-			needPing:       true,
-			client:         mcpClient,
-			options:        conf.Options,
-			requestTimeout: time.Duration(v.Timeout),
-		}, nil
+		drainStderr(c.name, raw)
+		return raw, nil
 	case *SSEMCPClientConfig:
-		if v.OAuth != nil {
-			oc, oErr := buildOAuthConfig(name, v.OAuth)
-			if oErr != nil {
-				return nil, oErr
-			}
-			options := sseClientOptions(v)
-			mcpClient, err := client.NewOAuthSSEClient(v.URL, oc, options...)
-			if err != nil {
-				return nil, err
-			}
-			return &Client{
-				name:            name,
-				needPing:        true,
-				needManualStart: true,
-				client:          mcpClient,
-				options:         conf.Options,
-			}, nil
-		}
 		options := sseClientOptions(v)
-		mcpClient, err := client.NewSSEMCPClient(v.URL, options...)
-		if err != nil {
-			return nil, err
-		}
-		return &Client{
-			name:            name,
-			needPing:        true,
-			needManualStart: true,
-			client:          mcpClient,
-			options:         conf.Options,
-		}, nil
-	case *StreamableMCPClientConfig:
 		if v.OAuth != nil {
-			oc, oErr := buildOAuthConfig(name, v.OAuth)
-			if oErr != nil {
-				return nil, oErr
-			}
-			options := streamableClientOptions(v)
-			mcpClient, err := client.NewOAuthStreamableHttpClient(v.URL, oc, options...)
+			oc, err := buildOAuthConfig(c.name, v.OAuth)
 			if err != nil {
 				return nil, err
 			}
-			return &Client{
-				name:            name,
-				needPing:        true,
-				needManualStart: true,
-				client:          mcpClient,
-				options:         conf.Options,
-			}, nil
+			return client.NewOAuthSSEClient(v.URL, oc, options...)
 		}
+		return client.NewSSEMCPClient(v.URL, options...)
+	case *StreamableMCPClientConfig:
 		options := streamableClientOptions(v)
-		mcpClient, err := client.NewStreamableHttpClient(v.URL, options...)
-		if err != nil {
-			return nil, err
+		if v.OAuth != nil {
+			oc, err := buildOAuthConfig(c.name, v.OAuth)
+			if err != nil {
+				return nil, err
+			}
+			return client.NewOAuthStreamableHttpClient(v.URL, oc, options...)
 		}
-		return &Client{
-			name:            name,
-			needPing:        true,
-			needManualStart: true,
-			client:          mcpClient,
-			options:         conf.Options,
-		}, nil
+		return client.NewStreamableHttpClient(v.URL, options...)
 	}
 	return nil, errors.New("invalid client type")
 }
 
-func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementation, mcpServer *server.MCPServer) error {
-	if c.needManualStart {
-		err := c.client.Start(ctx)
+// getClient returns the live transport, or nil before the first connection.
+// Forwarded calls and the health probe go through it, so reconnecting can swap
+// the transport underneath them.
+func (c *Client) getClient() *client.Client {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.client
+}
+
+// connect builds a transport, initializes it, swaps it in (closing the previous
+// one), then (re)registers the downstream's tools/prompts/resources. Tool
+// handlers resolve the live client via getClient at call time, so the swap is
+// transparent to in-flight and future requests.
+func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcpServer *server.MCPServer) error {
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
+
+	if c.closed.Load() {
+		return errors.New("client is closed")
+	}
+
+	// Reuse the transport built at construction for the very first attempt;
+	// after that (or after a failed first attempt, which nils it out) build a
+	// fresh one so a dead transport is never reused.
+	raw := c.getClient()
+	if raw == nil || c.hasConnected {
+		var err error
+		raw, err = c.buildRawClient()
 		if err != nil {
+			return err
+		}
+	}
+
+	connected := false
+	// Until the swap below succeeds, this transport is not owned by the client
+	// and must be closed on the way out.
+	defer func() {
+		if !connected {
+			_ = raw.Close()
+		}
+	}()
+
+	// Start is given the long-lived context, not a bounded one: mcp-go's SSE
+	// transport ties its event stream to the context Start receives, and stdio
+	// stores it for request handling, so a deadline there would tear the
+	// session down as soon as it elapsed.
+	if c.needManualStart {
+		if err := raw.Start(ctx); err != nil {
+			c.forget(raw)
 			return oauthAwareError(c.name, err)
 		}
 	}
+
+	// Initialize is a request/response, so it is bounded: a downstream that
+	// accepts the connection and then goes silent must not wedge a retry loop
+	// forever. Tool/prompt/resource listing below uses the caller's context,
+	// since a large catalog can legitimately take longer than a handshake.
+	initCtx, cancel := context.WithTimeout(ctx, connectTimeout)
+	defer cancel()
+
 	initRequest := mcp.InitializeRequest{}
 	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initRequest.Params.ClientInfo = clientInfo
@@ -193,22 +248,39 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 		Roots:        nil,
 		Sampling:     nil,
 	}
-	_, err := c.client.Initialize(ctx, initRequest)
-	if err != nil {
+	if _, err := raw.Initialize(initCtx, initRequest); err != nil {
+		c.forget(raw)
 		return oauthAwareError(c.name, err)
+	}
+
+	c.mu.Lock()
+	old := c.client
+	c.client = raw
+	c.mu.Unlock()
+	connected = true
+	// The transport is established now, so any later attempt must build a new
+	// one rather than re-initializing this one.
+	c.hasConnected = true
+	if old != nil && old != raw {
+		_ = old.Close()
+	}
+	// Close does not hold connectMu, so it may have run while this transport was
+	// being built - it would have closed the previous one, not this. Close this
+	// one here rather than leak it (a stdio transport owns a subprocess).
+	if c.closed.Load() {
+		_ = raw.Close()
+		return errors.New("client is closed")
 	}
 	slog.Info("Successfully initialized MCP client", "client", c.name)
 
-	// Bound the tool/prompt/resource discovery so a downstream that answers
-	// initialize and then goes silent mid-listing cannot wedge this attempt
-	// forever: the transports carry no timeout of their own for these calls.
-	// Start is deliberately not bounded - its context is the connection
-	// lifetime, so a deadline there would tear the session down.
+	// Bound the catalog discovery so a downstream that answers initialize and
+	// then goes silent cannot wedge this attempt (and the retry loop with it).
+	// The transports use this ctx per request, so it does not tear down the
+	// connection the way bounding Start would.
 	catalogCtx, cancelCatalog := context.WithTimeout(ctx, catalogTimeout)
 	defer cancelCatalog()
 
-	err = c.addToolsToServer(catalogCtx, mcpServer)
-	if err != nil {
+	if err := c.addToolsToServer(catalogCtx, mcpServer); err != nil {
 		return err
 	}
 	_ = c.addPromptsToServer(catalogCtx, mcpServer)
@@ -216,10 +288,39 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 	_ = c.addResourceTemplatesToServer(catalogCtx, mcpServer)
 
 	c.health.Store(int32(healthOK))
+	return nil
+}
+
+// forget drops a transport that failed to establish, so the next attempt
+// builds a new one instead of reusing a broken one.
+func (c *Client) forget(raw *client.Client) {
+	c.mu.Lock()
+	if c.client == raw {
+		c.client = nil
+	}
+	c.mu.Unlock()
+}
+
+func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementation, mcpServer *server.MCPServer) error {
+	c.clientInfo = clientInfo
+	c.mcpServer = mcpServer
+
+	if err := c.connect(ctx, clientInfo, mcpServer); err != nil {
+		return err
+	}
+
 	if c.needPing {
-		go c.startPingTask(ctx)
+		c.pingOnce.Do(func() {
+			go c.startPingTask(ctx)
+		})
 	}
 	return nil
+}
+
+// reconnect rebuilds a dropped downstream using the details remembered at
+// first connect. It is only called from the ping task.
+func (c *Client) reconnect(ctx context.Context) error {
+	return c.connect(ctx, c.clientInfo, c.mcpServer)
 }
 
 // callTool forwards a tool call to the downstream, bounded by requestTimeout
@@ -234,12 +335,16 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 // transports, so requestTimeout is left zero for them and the caller's context
 // is forwarded unchanged.
 func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	cl := c.getClient()
+	if cl == nil {
+		return nil, errors.New("downstream is not connected")
+	}
 	if c.requestTimeout <= 0 {
-		return c.client.CallTool(ctx, request)
+		return cl.CallTool(ctx, request)
 	}
 	callCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
 	defer cancel()
-	return c.client.CallTool(callCtx, request)
+	return cl.CallTool(callCtx, request)
 }
 
 // drainStderr keeps reading a stdio subprocess's stderr for as long as it runs.
@@ -275,15 +380,19 @@ func drainStderr(name string, mcpClient *client.Client) {
 // and then stalls cannot block the health loop until shutdown.
 const pingTimeout = 10 * time.Second
 
+// connectTimeout bounds one establish attempt. A downstream that accepts the
+// connection and then never completes initialize must not wedge a retry loop.
+const connectTimeout = 30 * time.Second
+
 // catalogTimeout bounds the tool/prompt/resource discovery half of one connect
 // attempt. The transports carry no timeout of their own for these calls (the
 // stdio and streamable-http clients have none by default), so without this a
 // downstream that completes initialize and then goes silent mid-listing would
-// leave the route unmounted forever. It is far looser than a single request
-// because a large catalog is legitimately slow.
+// leave the route unmounted forever and never reach the retry loop. It is far
+// looser than connectTimeout because a large catalog is legitimately slow.
 //
 // It is a variable so tests can shorten it; the e2e suite drives the real binary
-// and so cannot, which is why the regression test lives in the package.
+// and so cannot, which is why the regression test for this lives in the package.
 var catalogTimeout = 60 * time.Second
 
 // probe liveness of a downstream connection. Protocol version 2026-07-28
@@ -296,14 +405,18 @@ var catalogTimeout = 60 * time.Second
 // is the one call every mounted client already answered during startup, so it
 // works for both protocol eras.
 func (c *Client) probe(ctx context.Context) error {
-	if mcp.IsModernProtocol(c.client.ProtocolVersion()) {
-		_, err := c.client.ListTools(ctx, mcp.ListToolsRequest{})
+	cl := c.getClient()
+	if cl == nil {
+		return errors.New("downstream is not connected")
+	}
+	if mcp.IsModernProtocol(cl.ProtocolVersion()) {
+		_, err := cl.ListTools(ctx, mcp.ListToolsRequest{})
 		return err
 	}
 	// Ping is deprecated because it is a no-op on modern connections - which is
 	// exactly why probe() only reaches it on legacy ones. There is no
 	// replacement liveness call for servers older than 2026-07-28.
-	return c.client.Ping(ctx) //nolint:staticcheck // intentional legacy fallback, see above
+	return cl.Ping(ctx) //nolint:staticcheck // intentional legacy fallback, see above
 }
 
 // pingFailureThreshold is how many probes in a row have to fail before the
@@ -325,6 +438,7 @@ func (c *Client) startPingTask(ctx context.Context) {
 	ticker := time.NewTicker(c.options.pingInterval())
 	defer ticker.Stop()
 
+	autoReconnect := c.options.AutoReconnect.OrElse(false)
 	failCount := 0
 	for {
 		select {
@@ -338,21 +452,47 @@ func (c *Client) startPingTask(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			if err != nil && isTransportFailure(err) {
-				failCount++
-				slog.Warn("MCP health probe failed", "client", c.name, "err", err, "failures", failCount)
-				if failCount >= pingFailureThreshold {
-					c.health.Store(int32(healthFailed))
+			if err == nil {
+				if failCount > 0 {
+					slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
+					failCount = 0
 				}
+				c.health.Store(int32(healthOK))
 				continue
 			}
-			if err != nil {
+			if !isTransportFailure(err) {
+				// A downstream that answers with a JSON-RPC error is alive - it
+				// may simply not implement the probe. Only a broken connection
+				// counts against it.
 				slog.Debug("MCP health probe answered with an error, treating as alive", "client", c.name, "err", err)
+				if failCount > 0 {
+					slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
+					failCount = 0
+				}
+				c.health.Store(int32(healthOK))
+				continue
 			}
-			if failCount > 0 {
-				slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
-				failCount = 0
+
+			failCount++
+			slog.Warn("MCP health probe failed", "client", c.name, "err", err, "failures", failCount)
+			if failCount < pingFailureThreshold {
+				continue
 			}
+			c.health.Store(int32(healthFailed))
+
+			if !autoReconnect {
+				continue
+			}
+			// Rebuild the downstream from scratch. connect() swaps the live
+			// transport in, so requests that arrive during the rebuild keep
+			// using the old one until the new one is ready.
+			rErr := c.reconnect(ctx)
+			if rErr != nil {
+				slog.Warn("Failed to reconnect downstream", "client", c.name, "err", rErr)
+				continue
+			}
+			slog.Info("Reconnected downstream", "client", c.name, "afterFailures", failCount)
+			failCount = 0
 			c.health.Store(int32(healthOK))
 		}
 	}
@@ -392,135 +532,186 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 		}
 	}
 
+	cl := c.getClient()
+	if cl == nil {
+		return errors.New("downstream is not connected")
+	}
+	// Collect first and replace the whole set at the end. AddTool is an upsert,
+	// so adding into the existing set would leave a tool the downstream no
+	// longer exposes registered after a reconnect (e.g. it was restarted on a
+	// smaller tool set). SetTools replaces, which drops the vanished entries.
+	tools := make([]server.ServerTool, 0)
 	for {
-		tools, err := c.client.ListTools(ctx, toolsRequest)
+		listed, err := cl.ListTools(ctx, toolsRequest)
 		if err != nil {
 			return err
 		}
-		if tools == nil {
+		if listed == nil {
 			return fmt.Errorf("<%s> ListTools returned nil response without error", c.name)
 		}
-		if len(tools.Tools) == 0 {
+		if len(listed.Tools) == 0 {
 			break
 		}
-		slog.Debug("Successfully listed tools", "client", c.name, "count", len(tools.Tools))
-		for _, tool := range tools.Tools {
-			if filterFunc(tool.Name) {
-				slog.Debug("Adding tool", "client", c.name, "tool", tool.Name)
-				toolName := tool.Name
-				mcpServer.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-					result, err := c.callTool(ctx, request)
-					if err != nil {
-						slog.Error("Tool call failed", "client", c.name, "tool", toolName, "err", err)
-					} else if result != nil && result.IsError {
-						slog.Error("Tool call failed", "client", c.name, "tool", toolName, "isError", true)
-					}
-					return result, err
-				})
+		slog.Debug("Successfully listed tools", "client", c.name, "count", len(listed.Tools))
+		for _, tool := range listed.Tools {
+			if !filterFunc(tool.Name) {
+				continue
 			}
+			slog.Debug("Adding tool", "client", c.name, "tool", tool.Name)
+			toolName := tool.Name
+			tools = append(tools, server.ServerTool{Tool: tool, Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				result, err := c.callTool(ctx, request)
+				if err != nil {
+					slog.Error("Tool call failed", "client", c.name, "tool", toolName, "err", err)
+				} else if result != nil && result.IsError {
+					slog.Error("Tool call failed", "client", c.name, "tool", toolName, "isError", true)
+				}
+				return result, err
+			}})
 		}
-		if tools.NextCursor == "" {
+		if listed.NextCursor == "" {
 			break
 		}
-		toolsRequest.Params.Cursor = tools.NextCursor
+		toolsRequest.Params.Cursor = listed.NextCursor
 	}
+	mcpServer.SetTools(tools...)
 
 	return nil
 }
 
 func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPServer) error {
+	cl := c.getClient()
+	if cl == nil {
+		return errors.New("downstream is not connected")
+	}
 	promptsRequest := mcp.ListPromptsRequest{}
+	// Collect and replace, so a prompt the downstream dropped is not left
+	// registered after a reconnect.
+	prompts := make([]server.ServerPrompt, 0)
 	for {
-		prompts, err := c.client.ListPrompts(ctx, promptsRequest)
+		listed, err := cl.ListPrompts(ctx, promptsRequest)
 		if err != nil {
 			return err
 		}
-		if prompts == nil {
+		if listed == nil {
 			return fmt.Errorf("<%s> ListPrompts returned nil response without error", c.name)
 		}
-		if len(prompts.Prompts) == 0 {
+		if len(listed.Prompts) == 0 {
 			break
 		}
-		slog.Debug("Successfully listed prompts", "client", c.name, "count", len(prompts.Prompts))
-		for _, prompt := range prompts.Prompts {
+		slog.Debug("Successfully listed prompts", "client", c.name, "count", len(listed.Prompts))
+		for _, prompt := range listed.Prompts {
 			slog.Debug("Adding prompt", "client", c.name, "prompt", prompt.Name)
-			mcpServer.AddPrompt(prompt, c.client.GetPrompt)
+			// Resolve the live client at call time so a reconnect is
+			// transparent to the handler.
+			prompts = append(prompts, server.ServerPrompt{Prompt: prompt, Handler: func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+				live := c.getClient()
+				if live == nil {
+					return nil, errors.New("downstream is not connected")
+				}
+				return live.GetPrompt(ctx, request)
+			}})
 		}
-		if prompts.NextCursor == "" {
+		if listed.NextCursor == "" {
 			break
 		}
-		promptsRequest.Params.Cursor = prompts.NextCursor
+		promptsRequest.Params.Cursor = listed.NextCursor
 	}
+	mcpServer.SetPrompts(prompts...)
 	return nil
 }
 
 func (c *Client) addResourcesToServer(ctx context.Context, mcpServer *server.MCPServer) error {
+	cl := c.getClient()
+	if cl == nil {
+		return errors.New("downstream is not connected")
+	}
 	resourcesRequest := mcp.ListResourcesRequest{}
+	// Collect and replace, so a resource the downstream dropped is not left
+	// registered after a reconnect.
+	resources := make([]server.ServerResource, 0)
 	for {
-		resources, err := c.client.ListResources(ctx, resourcesRequest)
+		listed, err := cl.ListResources(ctx, resourcesRequest)
 		if err != nil {
 			return err
 		}
-		if resources == nil {
+		if listed == nil {
 			return fmt.Errorf("<%s> ListResources returned nil response without error", c.name)
 		}
-		if len(resources.Resources) == 0 {
+		if len(listed.Resources) == 0 {
 			break
 		}
-		slog.Debug("Successfully listed resources", "client", c.name, "count", len(resources.Resources))
-		for _, resource := range resources.Resources {
+		slog.Debug("Successfully listed resources", "client", c.name, "count", len(listed.Resources))
+		for _, resource := range listed.Resources {
 			slog.Debug("Adding resource", "client", c.name, "resource", resource.Name)
-			mcpServer.AddResource(resource, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-				readResource, e := c.client.ReadResource(ctx, request)
-				if e != nil {
-					return nil, e
-				}
-				return readResource.Contents, nil
-			})
+			resources = append(resources, server.ServerResource{Resource: resource, Handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+				return c.readResource(ctx, request)
+			}})
 		}
-		if resources.NextCursor == "" {
+		if listed.NextCursor == "" {
 			break
 		}
-		resourcesRequest.Params.Cursor = resources.NextCursor
+		resourcesRequest.Params.Cursor = listed.NextCursor
 
 	}
+	mcpServer.SetResources(resources...)
 	return nil
 }
 
 func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *server.MCPServer) error {
+	cl := c.getClient()
+	if cl == nil {
+		return errors.New("downstream is not connected")
+	}
 	resourceTemplatesRequest := mcp.ListResourceTemplatesRequest{}
+	// Collect and replace, so a template the downstream dropped is not left
+	// registered after a reconnect.
+	resourceTemplates := make([]server.ServerResourceTemplate, 0)
 	for {
-		resourceTemplates, err := c.client.ListResourceTemplates(ctx, resourceTemplatesRequest)
+		listed, err := cl.ListResourceTemplates(ctx, resourceTemplatesRequest)
 		if err != nil {
 			return err
 		}
-		if resourceTemplates == nil || len(resourceTemplates.ResourceTemplates) == 0 {
+		if listed == nil || len(listed.ResourceTemplates) == 0 {
 			break
 		}
-		slog.Debug("Successfully listed resource templates", "client", c.name, "count", len(resourceTemplates.ResourceTemplates))
-		for _, resourceTemplate := range resourceTemplates.ResourceTemplates {
+		slog.Debug("Successfully listed resource templates", "client", c.name, "count", len(listed.ResourceTemplates))
+		for _, resourceTemplate := range listed.ResourceTemplates {
 			slog.Debug("Adding resource template", "client", c.name, "template", resourceTemplate.Name)
-			mcpServer.AddResourceTemplate(resourceTemplate, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-				readResource, e := c.client.ReadResource(ctx, request)
-				if e != nil {
-					return nil, e
-				}
-				return readResource.Contents, nil
-			})
+			resourceTemplates = append(resourceTemplates, server.ServerResourceTemplate{Template: resourceTemplate, Handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+				return c.readResource(ctx, request)
+			}})
 		}
-		if resourceTemplates.NextCursor == "" {
+		if listed.NextCursor == "" {
 			break
 		}
-		resourceTemplatesRequest.Params.Cursor = resourceTemplates.NextCursor
+		resourceTemplatesRequest.Params.Cursor = listed.NextCursor
 	}
+	mcpServer.SetResourceTemplates(resourceTemplates...)
 	return nil
 }
 
+// readResource resolves the live client at call time so a reconnect is
+// transparent to the handler.
+func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	cl := c.getClient()
+	if cl == nil {
+		return nil, errors.New("downstream is not connected")
+	}
+	readResource, err := cl.ReadResource(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return readResource.Contents, nil
+}
+
 func (c *Client) Close() error {
-	if c.client == nil {
+	c.closed.Store(true)
+	cl := c.getClient()
+	if cl == nil {
 		return nil
 	}
-	err := c.client.Close()
+	err := cl.Close()
 	// A stdio subprocess that already died, or that exits non-zero when its
 	// stdin is closed (many MCP servers do), is not a failure to close it.
 	// Reporting it as one would make the proxy exit non-zero after an

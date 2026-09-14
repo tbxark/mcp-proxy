@@ -170,16 +170,38 @@ type readinessReport struct {
 	unhealthy []string
 }
 
-// clientStartupError applies the per-server failure policy: a downstream
-// server that cannot be started is logged and left unmounted so the rest of
-// the proxy still serves, unless that server set panicIfInvalid, which makes
-// it fatal for the whole process.
-func clientStartupError(name string, clientConfig *MCPClientConfigV2, err error) error {
-	slog.Error("Failed to start client", "client", name, "err", err)
+// fatalStartupError applies the panicIfInvalid half of the per-server failure
+// policy: it returns err when that server asked for a fast, fatal failure, and
+// nil otherwise. It deliberately does not log, because the caller knows whether
+// the failure is terminal (log an error) or about to be retried (log nothing;
+// the retry line carries the detail). Logging here unconditionally would emit
+// an ERROR for every retry attempt of a backend that is simply not up yet.
+func fatalStartupError(clientConfig *MCPClientConfigV2, err error) error {
 	if clientConfig.Options.PanicIfInvalid.OrElse(false) {
 		return err
 	}
 	return nil
+}
+
+// clientStartupError reports a downstream that could not be started and will
+// not be retried, so the rest of the proxy still serves. It returns err when
+// panicIfInvalid makes the failure fatal for the whole process.
+func clientStartupError(name string, clientConfig *MCPClientConfigV2, err error) error {
+	slog.Error("Failed to start client", "client", name, "err", err)
+	return fatalStartupError(clientConfig, err)
+}
+
+// retryWait sleeps out one reconnect interval, reporting false if the context
+// ended first (the proxy is shutting down).
+func retryWait(ctx context.Context, interval time.Duration) bool {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func startHTTPServer(config *Config) error {
@@ -241,59 +263,124 @@ func startHTTPServer(config *Config) error {
 			slog.Info("Disabled", "client", name)
 			continue
 		}
+		// mountRoute publishes a client's endpoint once it has connected. It
+		// runs exactly once per server; a backend that was down at startup and
+		// connects later is mounted then, by the retry below.
+		var mountOnce sync.Once
+		mountRoute := func(mcpClient *Client, server *Server) {
+			mountOnce.Do(func() {
+				// Outermost first: recover also guards the middlewares below it,
+				// and the logger records requests that auth rejects.
+				middlewares := make([]MiddlewareFunc, 0)
+				middlewares = append(middlewares, recoverMiddleware(name))
+				if clientConfig.Options.LogEnabled.OrElse(false) {
+					middlewares = append(middlewares, loggerMiddleware(name))
+				}
+				if len(clientConfig.Options.AuthTokens) > 0 {
+					middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
+				}
+				mcpRoute := path.Join(baseURL.Path, name)
+				if !strings.HasPrefix(mcpRoute, "/") {
+					mcpRoute = "/" + mcpRoute
+				}
+				if !strings.HasSuffix(mcpRoute, "/") {
+					mcpRoute += "/"
+				}
+				slog.Info("Handling requests", "client", name, "route", mcpRoute)
+				httpMux.Handle(mcpRoute, chainMiddleware(server.handler, middlewares...))
+				httpServer.RegisterOnShutdown(func() {
+					slog.Info("Shutting down", "client", name)
+					if cErr := mcpClient.Close(); cErr != nil {
+						slog.Error("Failed to close client", "client", name, "err", cErr)
+					}
+				})
+			})
+		}
+
 		errorGroup.Go(func() error {
 			slog.Info("Connecting", "client", name)
-			// Creating a stdio client already spawns the subprocess, so a
-			// missing command fails here rather than while connecting. Both
-			// have to obey the same panicIfInvalid policy.
-			mcpClient, err := newMCPClient(name, clientConfig)
-			if err != nil {
-				return clientStartupError(name, clientConfig, err)
-			}
-			clientsMu.Lock()
-			if shuttingDown.Load() {
-				clientsMu.Unlock()
-				// shutdown already closed everything it knew about, and this
-				// client is not in that map. Nobody else will close it - and
-				// for stdio it owns a subprocess.
-				slog.Info("Shutting down", "client", name)
-				if cErr := mcpClient.Close(); cErr != nil {
-					slog.Error("Failed to close client", "client", name, "err", cErr)
+			autoReconnect := clientConfig.Options.AutoReconnect.OrElse(false)
+			interval := clientConfig.Options.reconnectInterval()
+
+			var (
+				mcpClient *Client
+				server    *Server
+			)
+			for {
+				// Creating a stdio client already spawns the subprocess, so a
+				// missing command fails here rather than while connecting. Both
+				// have to obey the same panicIfInvalid policy.
+				if mcpClient == nil {
+					created, err := newMCPClient(name, clientConfig)
+					if err != nil {
+						// Terminal unless it will be retried: log an error for a
+						// failure that ends the attempt, and stay quiet on the
+						// retry path (an unreachable backend is not an error).
+						if fatal := fatalStartupError(clientConfig, err); fatal != nil {
+							slog.Error("Failed to start client", "client", name, "err", err)
+							return fatal
+						}
+						if !autoReconnect {
+							slog.Error("Failed to start client", "client", name, "err", err)
+							return nil
+						}
+						slog.Warn("Retrying client creation", "client", name, "err", err, "retryIn", interval)
+						if !retryWait(ctx, interval) {
+							return nil
+						}
+						continue
+					}
+					mcpClient = created
+					clientsMu.Lock()
+					if shuttingDown.Load() {
+						clientsMu.Unlock()
+						// shutdown already closed everything it knew about, and
+						// this client is not in that map. Nobody else will close
+						// it - and for stdio it owns a subprocess.
+						slog.Info("Shutting down", "client", name)
+						if cErr := mcpClient.Close(); cErr != nil {
+							slog.Error("Failed to close client", "client", name, "err", cErr)
+						}
+						return nil
+					}
+					clients[name] = mcpClient
+					clientsMu.Unlock()
+
+					newServer, sErr := newMCPServer(name, config.McpProxy, clientConfig)
+					if sErr != nil {
+						// A malformed server definition will not fix itself, so
+						// it is never retried.
+						return clientStartupError(name, clientConfig, sErr)
+					}
+					server = newServer
 				}
-				return nil
-			}
-			clients[name] = mcpClient
-			clientsMu.Unlock()
 
-			server, err := newMCPServer(name, config.McpProxy, clientConfig)
-			if err != nil {
-				return clientStartupError(name, clientConfig, err)
+				err := mcpClient.addToMCPServer(ctx, info, server.mcpServer)
+				if err == nil {
+					slog.Info("Connected", "client", name)
+					mountRoute(mcpClient, server)
+					return nil
+				}
+				if fatal := fatalStartupError(clientConfig, err); fatal != nil {
+					slog.Error("Failed to start client", "client", name, "err", err)
+					return fatal
+				}
+				if mcpClient.closed.Load() {
+					// Shutdown already closed this client; not a startup error.
+					return nil
+				}
+				if !autoReconnect {
+					slog.Error("Failed to start client", "client", name, "err", err)
+					return nil
+				}
+				// The backend is simply not up yet: wait and try again. The
+				// route is mounted only once it connects, so readiness keeps
+				// reporting it as not mounted until then.
+				slog.Warn("Retrying connection", "client", name, "err", err, "retryIn", interval)
+				if !retryWait(ctx, interval) {
+					return nil
+				}
 			}
-			if err := mcpClient.addToMCPServer(ctx, info, server.mcpServer); err != nil {
-				return clientStartupError(name, clientConfig, err)
-			}
-			slog.Info("Connected", "client", name)
-
-			// Outermost first: recover also guards the middlewares below it,
-			// and the logger records requests that auth rejects.
-			middlewares := make([]MiddlewareFunc, 0)
-			middlewares = append(middlewares, recoverMiddleware(name))
-			if clientConfig.Options.LogEnabled.OrElse(false) {
-				middlewares = append(middlewares, loggerMiddleware(name))
-			}
-			if len(clientConfig.Options.AuthTokens) > 0 {
-				middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
-			}
-			mcpRoute := path.Join(baseURL.Path, name)
-			if !strings.HasPrefix(mcpRoute, "/") {
-				mcpRoute = "/" + mcpRoute
-			}
-			if !strings.HasSuffix(mcpRoute, "/") {
-				mcpRoute += "/"
-			}
-			slog.Info("Handling requests", "client", name, "route", mcpRoute)
-			httpMux.Handle(mcpRoute, chainMiddleware(server.handler, middlewares...))
-			return nil
 		})
 	}
 

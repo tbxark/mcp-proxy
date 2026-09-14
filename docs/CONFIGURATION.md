@@ -179,8 +179,19 @@ looking, from the logs, like a refresh failure with no obvious cause.
   - `mode`: `allow` or `block`.
   - `list`: List of tool names.
 - `Disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
+- `autoReconnect` (bool, default `false`): Keep a downstream connection alive across
+  failures. When true, a server that is unreachable at startup is retried every
+  `reconnectInterval` until it connects (its route is mounted then), and a connection
+  that drops is rebuilt in place instead of staying `degraded` until the proxy is
+  restarted. Off by default: with the health endpoints, the usual deployment contract is
+  that an orchestrator restarts the proxy, so a proxy that repairs itself by default
+  would hide the failure. Ignored when `panicIfInvalid` is true, which keeps failing fast.
+- `reconnectInterval` (duration string, default `"15s"`): gap between attempts while a
+  downstream with `autoReconnect` is unreachable. Only meaningful with `autoReconnect`.
 
 Notes:
 
 - `mcpProxy.options.authTokens` serves as the default token set if a server omits `options.authTokens`.
+- `mcpProxy.options` values (including `autoReconnect` and `reconnectInterval`) are
+  defaults for servers that omit them, so a fleet-wide setting can be declared once.
 - To discover tool names for filtering, start without a filter and check logs for lines like `<server> Adding tool <name>`.

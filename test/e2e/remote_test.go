@@ -3,11 +3,13 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -69,11 +71,9 @@ func (d *downstreamRecorder) values(key string) []string {
 	return seen
 }
 
-// startDownstreamMCP serves a minimal MCP server over the given transport and
-// returns the URL mcp-proxy should be pointed at.
-func startDownstreamMCP(t *testing.T, transportType string) (string, *downstreamRecorder, *httptest.Server) {
-	t.Helper()
-
+// newDownstreamHandler builds the minimal echo MCP server these tests proxy to,
+// returning the handler and the route suffix its transport expects.
+func newDownstreamHandler(transportType string) (http.Handler, string) {
 	mcpServer := server.NewMCPServer("downstream", "1.0.0", server.WithToolCapabilities(true))
 	mcpServer.AddTool(
 		mcp.NewTool("echo", mcp.WithString("message", mcp.Required())),
@@ -86,14 +86,43 @@ func startDownstreamMCP(t *testing.T, transportType string) (string, *downstream
 		},
 	)
 
-	var handler http.Handler
-	suffix := ""
 	if transportType == "sse" {
-		handler = server.NewSSEServer(mcpServer)
-		suffix = "/sse"
-	} else {
-		handler = server.NewStreamableHTTPServer(mcpServer, server.WithStateLess(true))
+		return server.NewSSEServer(mcpServer), "/sse"
 	}
+	return server.NewStreamableHTTPServer(mcpServer, server.WithStateLess(true)), "/mcp"
+}
+
+// startDownstreamOnAddr serves the standard echo downstream on a fixed address,
+// so a test can take it away and put a replacement back on the same port. The
+// bind is retried briefly: a listener closed moments ago may not be released
+// yet, and the test only rebinds to prove the proxy recovered.
+func startDownstreamOnAddr(t *testing.T, addr, transportType string) *httptest.Server {
+	t.Helper()
+
+	handler, _ := newDownstreamHandler(transportType)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		listener, err := net.Listen("tcp", addr)
+		if err == nil {
+			downstream := httptest.NewUnstartedServer(handler)
+			downstream.Listener = listener
+			downstream.Start()
+			t.Cleanup(downstream.Close)
+			return downstream
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("listen on %s: %v", addr, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// startDownstreamMCP serves a minimal MCP server over the given transport and
+// returns the URL mcp-proxy should be pointed at.
+func startDownstreamMCP(t *testing.T, transportType string) (string, *downstreamRecorder, *httptest.Server) {
+	t.Helper()
+
+	handler, suffix := newDownstreamHandler(transportType)
 
 	recorder := &downstreamRecorder{}
 	downstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -273,5 +302,182 @@ func TestSSERemoteServerHealthDegrades(t *testing.T) {
 	body := proxy.waitForReadyState(t, http.StatusServiceUnavailable)
 	if !strings.Contains(body, `"unhealthy":["remote"]`) {
 		t.Errorf("/_readyz body = %s, want the remote server named", body)
+	}
+}
+
+// autoReconnectConfig points the proxy at a downstream URL with the given
+// per-server options, so a test can toggle autoReconnect without a template.
+func autoReconnectConfig(t *testing.T, downstreamURL string, extraOptions string) (string, string) {
+	t.Helper()
+
+	addr := freeAddr(t)
+	configPath := writeConfig(t, fmt.Sprintf(`{
+  "mcpProxy": {
+    "baseURL": "http://%[1]s", "addr": "%[1]s", "name": "p", "version": "1",
+    "type": "streamable-http", "startupGracePeriod": "`+testGracePeriod+`",
+    "options": {"pingInterval": "`+testPingInterval+`"}
+  },
+  "mcpServers": {
+    "remote": {
+      "transportType": "streamable-http",
+      "url": "%[2]s",
+      "options": %[3]s
+    }
+  }
+}`, addr, downstreamURL, extraOptions))
+	return configPath, addr
+}
+
+// A backend that is down when the proxy starts must be mounted once it appears,
+// instead of 404ing until the whole proxy is restarted. The route is published
+// only after a successful connection, so autoReconnect keeps trying in the
+// background until then.
+func TestAutoReconnectMountsBackendThatStartsLater(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	// The downstream address is known up front but nothing is listening yet.
+	downstreamAddr := freeAddr(t)
+	downstreamURL := "http://" + downstreamAddr + "/mcp"
+	configPath, addr := autoReconnectConfig(t, downstreamURL,
+		`{"autoReconnect": true, "reconnectInterval": "100ms"}`)
+
+	proxy := launchProxy(t, configPath, addr)
+
+	// Nothing has connected, so the proxy reports that it has no routes and the
+	// endpoint 404s - the state the retry exists to escape.
+	proxy.waitForReadyBody(t, http.StatusServiceUnavailable, `"status":"unavailable"`)
+	if got := proxy.get(t, "/remote/mcp"); got != http.StatusNotFound {
+		t.Errorf("route before the backend exists = %d, want 404", got)
+	}
+
+	// Bring the backend up on the address the proxy is already retrying.
+	startDownstreamOnAddr(t, downstreamAddr, "streamable-http")
+
+	// The retry connects and mounts the route, which flips readiness to 200 and
+	// makes the endpoint serve traffic.
+	proxy.waitForReady(t)
+	mcpClient := proxy.connect(t, "streamable-http", "remote")
+	if got := callToolText(t, mcpClient, "echo", map[string]any{"message": "late"}); got != "downstream:late" {
+		t.Errorf("echo after late connect = %q, want %q", got, "downstream:late")
+	}
+}
+
+// A backend that drops after connecting has to be rebuilt in place, so the
+// endpoint keeps serving from the same route instead of staying degraded until
+// a restart.
+func TestAutoReconnectRebuildsDroppedBackend(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	downstreamAddr := freeAddr(t)
+	downstreamURL := "http://" + downstreamAddr + "/mcp"
+	configPath, addr := autoReconnectConfig(t, downstreamURL,
+		`{"autoReconnect": true, "reconnectInterval": "100ms"}`)
+
+	downstream := startDownstreamOnAddr(t, downstreamAddr, "streamable-http")
+	proxy := startProxy(t, configPath, addr)
+
+	mcpClient := proxy.connect(t, "streamable-http", "remote")
+	if got := callToolText(t, mcpClient, "echo", map[string]any{"message": "before"}); got != "downstream:before" {
+		t.Fatalf("echo before the drop = %q, want %q", got, "downstream:before")
+	}
+
+	// Kill the backend, then take its place on the same address. The proxy
+	// retries on the configured interval, so the route recovers on its own.
+	downstream.CloseClientConnections()
+	downstream.Close()
+	downstream = startDownstreamOnAddr(t, downstreamAddr, "streamable-http")
+	defer downstream.Close()
+
+	proxy.waitForReady(t)
+	reconnected := proxy.connect(t, "streamable-http", "remote")
+	if got := callToolText(t, reconnected, "echo", map[string]any{"message": "after"}); got != "downstream:after" {
+		t.Errorf("echo after reconnect = %q, want %q", got, "downstream:after")
+	}
+}
+
+// A backend that is retried while down must not emit an ERROR per attempt: an
+// unreachable backend is the expected state the retry exists for, and a false
+// ERROR on every tick would fire alerting and bury real failures.
+func TestAutoReconnectRetriesWithoutErrorLogging(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	// Nothing listens here, so every attempt fails and is retried.
+	dead := freeAddr(t)
+	addr := freeAddr(t)
+	configPath := writeConfig(t, fmt.Sprintf(`{
+  "mcpProxy": {
+    "baseURL": "http://%[1]s", "addr": "%[1]s", "name": "p", "version": "1",
+    "type": "streamable-http", "startupGracePeriod": "1s",
+    "options": {"pingInterval": "`+testPingInterval+`"}
+  },
+  "mcpServers": {
+    "remote": {
+      "transportType": "streamable-http",
+      "url": "http://%[2]s/mcp",
+      "options": {"autoReconnect": true, "reconnectInterval": "100ms"}
+    }
+  }
+}`, addr, dead))
+
+	proxy := launchProxy(t, configPath, addr)
+
+	// Wait for the proxy to be serving, then let it fail and retry several times.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if code, _ := proxy.ready(t); code != 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(1 * time.Second)
+
+	logs := proxy.stderr.String()
+	retries := strings.Count(logs, "Retrying connection")
+	startErrors := strings.Count(logs, "Failed to start client")
+	if retries == 0 {
+		t.Fatalf("expected at least one retry, got none\n%s", logs)
+	}
+	if startErrors != 0 {
+		t.Errorf("retrying a down backend logged %d \"Failed to start client\" ERROR(s), want 0\n%s", startErrors, logs)
+	}
+}
+
+// A server that opted out of autoReconnect and is down at startup is a terminal
+// failure, so it must still be logged as an error exactly once.
+func TestAutoReconnectOffStillLogsStartupError(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	dead := freeAddr(t)
+	addr := freeAddr(t)
+	configPath := writeConfig(t, fmt.Sprintf(`{
+  "mcpProxy": {
+    "baseURL": "http://%[1]s", "addr": "%[1]s", "name": "p", "version": "1",
+    "type": "streamable-http", "startupGracePeriod": "1s"
+  },
+  "mcpServers": {
+    "remote": {"transportType": "streamable-http", "url": "http://%[2]s/mcp"}
+  }
+}`, addr, dead))
+
+	proxy := launchProxy(t, configPath, addr)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if code, _ := proxy.ready(t); code != 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	logs := proxy.stderr.String()
+	if !strings.Contains(logs, "Failed to start client") {
+		t.Errorf("a terminal startup failure was not logged as an error\n%s", logs)
+	}
+	if strings.Contains(logs, "Retrying connection") {
+		t.Errorf("autoReconnect is off, so nothing should be retried\n%s", logs)
 	}
 }

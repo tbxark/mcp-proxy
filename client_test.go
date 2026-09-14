@@ -192,10 +192,11 @@ func TestIsTransportFailure(t *testing.T) {
 // control exactly when tools/list answers (or does not). The real mcp-go server
 // always answers, which is why the listing-hang case cannot use it.
 type rawDownstream struct {
-	url           string
-	mu            sync.Mutex
-	tools         []string
-	hangToolsList bool
+	url            string
+	mu             sync.Mutex
+	tools          []string
+	hangToolsList  bool
+	toolsListCalls int
 }
 
 func newRawDownstream(t *testing.T) *rawDownstream {
@@ -242,6 +243,7 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 			})
 		case "tools/list":
 			d.mu.Lock()
+			d.toolsListCalls++
 			hang := d.hangToolsList
 			names := slices.Clone(d.tools)
 			d.mu.Unlock()
@@ -285,6 +287,35 @@ func (d *rawDownstream) hangToolsListCalls(hang bool) {
 	d.hangToolsList = hang
 }
 
+// serverToolNames reads back the tools registered on the proxy-side server.
+func serverToolNames(t *testing.T, mcpServer *server.MCPServer) []string {
+	t.Helper()
+
+	resp := mcpServer.HandleMessage(context.Background(), []byte(`{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+	}`))
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal tools/list response: %v", err)
+	}
+	var decoded struct {
+		Result struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal tools/list response: %v", err)
+	}
+	names := make([]string, 0, len(decoded.Result.Tools))
+	for _, tool := range decoded.Result.Tools {
+		names = append(names, tool.Name)
+	}
+	slices.Sort(names)
+	return names
+}
+
 func newProxyServerForTest(t *testing.T) *server.MCPServer {
 	t.Helper()
 
@@ -299,10 +330,49 @@ func newProxyServerForTest(t *testing.T) *server.MCPServer {
 	return proxyServer.mcpServer
 }
 
+// Regression for the reconnect path re-registering a shrunken catalog: AddTool
+// is an upsert, so without replace semantics a tool the downstream dropped stays
+// exposed. The registration must replace the whole set instead.
+func TestCatalogRegistrationDropsStaleToolsOnReRegister(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha", "beta")
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options:       &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	ctx := t.Context()
+	if err := mcpClient.addToMCPServer(ctx, mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	if got := serverToolNames(t, proxyServer); !slices.Equal(got, []string{"alpha", "beta"}) {
+		t.Fatalf("initial tools = %v, want [alpha beta]", got)
+	}
+
+	// The downstream shrank; a reconnect re-runs registration. The dropped tool
+	// must not survive.
+	downstream.setTools("alpha")
+	if err := mcpClient.addToolsToServer(ctx, proxyServer); err != nil {
+		t.Fatalf("re-register tools: %v", err)
+	}
+	if got := serverToolNames(t, proxyServer); !slices.Equal(got, []string{"alpha"}) {
+		t.Errorf("tools after re-registration = %v, want [alpha]", got)
+	}
+}
+
 // Regression for the listing half of connect being unbounded: a downstream that
 // completes initialize and then never answers tools/list would otherwise wedge
-// the connection attempt forever. catalogTimeout must turn that into a bounded
-// error.
+// the startup goroutine (and the retry loop) forever. catalogTimeout must turn
+// that into a bounded error.
 func TestCatalogTimeoutBoundsHungToolsList(t *testing.T) {
 	// Not parallel: it shortens the package-level catalogTimeout.
 	old := catalogTimeout
