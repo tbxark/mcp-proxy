@@ -199,13 +199,21 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 	}
 	slog.Info("Successfully initialized MCP client", "client", c.name)
 
-	err = c.addToolsToServer(ctx, mcpServer)
+	// Bound the tool/prompt/resource discovery so a downstream that answers
+	// initialize and then goes silent mid-listing cannot wedge this attempt
+	// forever: the transports carry no timeout of their own for these calls.
+	// Start is deliberately not bounded - its context is the connection
+	// lifetime, so a deadline there would tear the session down.
+	catalogCtx, cancelCatalog := context.WithTimeout(ctx, catalogTimeout)
+	defer cancelCatalog()
+
+	err = c.addToolsToServer(catalogCtx, mcpServer)
 	if err != nil {
 		return err
 	}
-	_ = c.addPromptsToServer(ctx, mcpServer)
-	_ = c.addResourcesToServer(ctx, mcpServer)
-	_ = c.addResourceTemplatesToServer(ctx, mcpServer)
+	_ = c.addPromptsToServer(catalogCtx, mcpServer)
+	_ = c.addResourcesToServer(catalogCtx, mcpServer)
+	_ = c.addResourceTemplatesToServer(catalogCtx, mcpServer)
 
 	c.health.Store(int32(healthOK))
 	if c.needPing {
@@ -266,6 +274,17 @@ func drainStderr(name string, mcpClient *client.Client) {
 // pingTimeout bounds a single probe, so a downstream that accepts the request
 // and then stalls cannot block the health loop until shutdown.
 const pingTimeout = 10 * time.Second
+
+// catalogTimeout bounds the tool/prompt/resource discovery half of one connect
+// attempt. The transports carry no timeout of their own for these calls (the
+// stdio and streamable-http clients have none by default), so without this a
+// downstream that completes initialize and then goes silent mid-listing would
+// leave the route unmounted forever. It is far looser than a single request
+// because a large catalog is legitimately slow.
+//
+// It is a variable so tests can shorten it; the e2e suite drives the real binary
+// and so cannot, which is why the regression test lives in the package.
+var catalogTimeout = 60 * time.Second
 
 // probe liveness of a downstream connection. Protocol version 2026-07-28
 // removed ping: the stateless protocol core has no connection to keep alive,
