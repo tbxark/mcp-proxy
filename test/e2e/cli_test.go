@@ -3,6 +3,7 @@ package e2e
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -174,5 +175,85 @@ func TestPanicIfInvalidStopsTheProxy(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "failed to initialize clients") {
 		t.Errorf("stderr = %q, want the client failure reason", stderr)
+	}
+}
+
+// A stdio downstream whose command does not exist yet (e.g. installed after the
+// proxy starts) must be retried rather than left unmounted forever. The stdio
+// client spawns its subprocess inside newMCPClient, so this exercises the
+// client-creation retry branch, not the connect retry.
+func TestAutoReconnectRetriesStdioCommandThatAppearsLater(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	fixture := filepath.ToSlash(buildFixture(t))
+	// The command the proxy is configured with, created only after startup.
+	script := filepath.Join(t.TempDir(), "later-server")
+	addr := freeAddr(t)
+	configPath := writeConfig(t, fmt.Sprintf(`{
+  "mcpProxy": {
+    "baseURL": "http://%[1]s", "addr": "%[1]s", "name": "p", "version": "1",
+    "type": "streamable-http", "startupGracePeriod": "1s"
+  },
+  "mcpServers": {
+    "later": {
+      "command": %[2]q,
+      "options": {"autoReconnect": true, "reconnectInterval": "100ms"}
+    }
+  }
+}`, addr, filepath.ToSlash(script)))
+
+	proxy := launchProxy(t, configPath, addr)
+
+	// The command does not exist yet, so the route is not mounted and the proxy
+	// names itself unavailable rather than ready.
+	proxy.waitForReadyBody(t, http.StatusServiceUnavailable, `"status":"unavailable"`)
+
+	// Create the command; the retry loop must find it and mount the route.
+	writeExecutable(t, script, "#!/bin/sh\nexec "+fixture+"\n")
+
+	proxy.waitForReady(t)
+	mcpClient := proxy.connect(t, "streamable-http", "later")
+	// The stdio fixture echoes the message back verbatim.
+	if got := callToolText(t, mcpClient, "echo", map[string]any{"message": "late"}); got != "late" {
+		t.Errorf("echo after the command appeared = %q, want %q", got, "late")
+	}
+}
+
+// panicIfInvalid is checked before autoReconnect, so a server with both must
+// still abort startup rather than being retried in the background.
+func TestPanicIfInvalidTakesPrecedenceOverAutoReconnect(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	addr := freeAddr(t)
+	configPath := writeConfig(t, fmt.Sprintf(`{
+  "mcpProxy": {
+    "baseURL": "http://%[1]s", "addr": "%[1]s", "name": "p", "version": "1",
+    "type": "streamable-http"
+  },
+  "mcpServers": {
+    "broken": {
+      "command": "/nonexistent/definitely-not-a-real-command",
+      "options": {"panicIfInvalid": true, "autoReconnect": true, "reconnectInterval": "50ms"}
+    }
+  }
+}`, addr))
+
+	_, stderr, err := runCLI(t, "-config", configPath)
+	if err == nil {
+		t.Fatalf("proxy exited 0 with panicIfInvalid and a broken client, want a non-zero status\n%s", stderr)
+	}
+	if strings.Contains(stderr, "Retrying client creation") {
+		t.Errorf("panicIfInvalid must not be retried in the background\n%s", stderr)
+	}
+}
+
+// writeExecutable writes content to path with the mode a spawned command needs.
+func writeExecutable(t *testing.T, path, content string) {
+	t.Helper()
+
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatalf("write %s: %v", path, err)
 	}
 }
