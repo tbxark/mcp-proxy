@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
 	"golang.org/x/sync/errgroup"
 )
@@ -189,6 +190,19 @@ func fatalStartupError(clientConfig *MCPClientConfigV2, err error) error {
 func clientStartupError(name string, clientConfig *MCPClientConfigV2, err error) error {
 	slog.Error("Failed to start client", "client", name, "err", err)
 	return fatalStartupError(clientConfig, err)
+}
+
+// permanentStartupError reports whether retrying cannot help: a downstream that
+// needs interactive OAuth authorization stays unconnectable until someone runs
+// `mcp-proxy -authorize`, so autoReconnect must stop rather than retry it every
+// interval forever and keep hitting the provider. The message already carries
+// the authorize command (see oauthAwareError), so the single ERROR is actionable.
+//
+// Only this case is classified. A plain 401 from a static bearer-token server is
+// a transport error indistinguishable from any other connection failure, and a
+// missing stdio command is expected to appear later, so both still retry.
+func permanentStartupError(err error) bool {
+	return client.IsOAuthAuthorizationRequiredError(err)
 }
 
 // retryWait sleeps out one reconnect interval, reporting false if the context
@@ -371,6 +385,13 @@ func startHTTPServer(config *Config) error {
 				}
 				if !autoReconnect {
 					slog.Error("Failed to start client", "client", name, "err", err)
+					return nil
+				}
+				if permanentStartupError(err) {
+					// Retrying cannot help - interactive OAuth is needed. Report
+					// it once, with the actionable message, and stop rather than
+					// hammering the provider every interval.
+					slog.Error("Not retrying, downstream cannot connect without intervention", "client", name, "err", err)
 					return nil
 				}
 				// The backend is simply not up yet: wait and try again. The

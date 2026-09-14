@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/mark3labs/mcp-go/client/transport"
 )
 
 // The recover middleware is listed first so it wraps the others: a panic in
@@ -172,5 +175,32 @@ func TestStartHTTPServerReturnsListenError(t *testing.T) {
 	err = startHTTPServer(config)
 	if err == nil || !strings.Contains(err.Error(), "HTTP server failed") {
 		t.Fatalf("startHTTPServer error = %v, want listen failure", err)
+	}
+}
+
+// A downstream that needs interactive OAuth cannot connect until someone runs
+// `mcp-proxy -authorize`, so autoReconnect must stop retrying it instead of
+// hammering the provider every interval. The classifier has to see through the
+// oauthAwareError wrapping.
+func TestPermanentStartupErrorClassification(t *testing.T) {
+	t.Parallel()
+
+	oauthErr := &transport.OAuthAuthorizationRequiredError{}
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "oauth authorization required", err: oauthErr, want: true},
+		{name: "wrapped by oauthAwareError", err: oauthAwareError("srv", oauthErr), want: true},
+		{name: "plain transport error", err: transport.NewError(errors.New("connection refused")), want: false},
+		{name: "nil", err: nil, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := permanentStartupError(tt.err); got != tt.want {
+				t.Errorf("permanentStartupError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
