@@ -5,12 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 func TestMCPHTTPClientRequestsUncompressedResponses(t *testing.T) {
@@ -181,4 +186,254 @@ func TestIsTransportFailure(t *testing.T) {
 			}
 		})
 	}
+}
+
+// rawDownstream is a hand-written streamable-http MCP endpoint, so a test can
+// control exactly when tools/list answers (or does not). The real mcp-go server
+// always answers, which is why the listing-hang case cannot use it.
+type rawDownstream struct {
+	url            string
+	mu             sync.Mutex
+	tools          []string
+	hangToolsList  bool
+	toolsListCalls int
+}
+
+func newRawDownstream(t *testing.T) *rawDownstream {
+	t.Helper()
+
+	d := &rawDownstream{}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.ID == nil {
+			// A notification (e.g. notifications/initialized): accept it.
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+
+		writeResult := func(result any) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"result":  result,
+			})
+		}
+
+		switch req.Method {
+		case "initialize":
+			writeResult(map[string]any{
+				"protocolVersion": mcp.LATEST_PROTOCOL_VERSION,
+				"capabilities":    map[string]any{},
+				"serverInfo":      map[string]string{"name": "downstream", "version": "1"},
+			})
+		case "tools/list":
+			d.mu.Lock()
+			d.toolsListCalls++
+			hang := d.hangToolsList
+			names := slices.Clone(d.tools)
+			d.mu.Unlock()
+			if hang {
+				<-r.Context().Done()
+				return
+			}
+			tools := make([]map[string]any, 0, len(names))
+			for _, name := range names {
+				tools = append(tools, map[string]any{
+					"name":        name,
+					"inputSchema": map[string]any{"type": "object"},
+				})
+			}
+			writeResult(map[string]any{"tools": tools})
+		case "prompts/list":
+			writeResult(map[string]any{"prompts": []any{}})
+		case "resources/list":
+			writeResult(map[string]any{"resources": []any{}})
+		case "resources/templates/list":
+			writeResult(map[string]any{"resourceTemplates": []any{}})
+		default:
+			writeResult(map[string]any{})
+		}
+	})
+	s := httptest.NewServer(handler)
+	t.Cleanup(s.Close)
+	d.url = s.URL
+	return d
+}
+
+func (d *rawDownstream) setTools(names ...string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.tools = slices.Clone(names)
+}
+
+func (d *rawDownstream) hangToolsListCalls(hang bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.hangToolsList = hang
+}
+
+// serverToolNames reads back the tools registered on the proxy-side server.
+func serverToolNames(t *testing.T, mcpServer *server.MCPServer) []string {
+	t.Helper()
+
+	resp := mcpServer.HandleMessage(context.Background(), []byte(`{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+	}`))
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal tools/list response: %v", err)
+	}
+	var decoded struct {
+		Result struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal tools/list response: %v", err)
+	}
+	names := make([]string, 0, len(decoded.Result.Tools))
+	for _, tool := range decoded.Result.Tools {
+		names = append(names, tool.Name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+func newProxyServerForTest(t *testing.T) *server.MCPServer {
+	t.Helper()
+
+	proxyServer, err := newMCPServer("test", &MCPProxyConfigV2{
+		Type:    MCPServerTypeStreamable,
+		Version: "1",
+		BaseURL: "http://localhost:9090",
+	}, &MCPClientConfigV2{Options: &OptionsV2{}})
+	if err != nil {
+		t.Fatalf("newMCPServer: %v", err)
+	}
+	return proxyServer.mcpServer
+}
+
+// Regression for the reconnect path re-registering a shrunken catalog: AddTool
+// is an upsert, so without replace semantics a tool the downstream dropped stays
+// exposed. The registration must replace the whole set instead.
+func TestCatalogRegistrationDropsStaleToolsOnReRegister(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha", "beta")
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options:       &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	ctx := t.Context()
+	if err := mcpClient.addToMCPServer(ctx, mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	if got := serverToolNames(t, proxyServer); !slices.Equal(got, []string{"alpha", "beta"}) {
+		t.Fatalf("initial tools = %v, want [alpha beta]", got)
+	}
+
+	// The downstream shrank; a reconnect re-runs registration. The dropped tool
+	// must not survive.
+	downstream.setTools("alpha")
+	if err := mcpClient.addToolsToServer(ctx, proxyServer); err != nil {
+		t.Fatalf("re-register tools: %v", err)
+	}
+	if got := serverToolNames(t, proxyServer); !slices.Equal(got, []string{"alpha"}) {
+		t.Errorf("tools after re-registration = %v, want [alpha]", got)
+	}
+}
+
+// Regression for the listing half of connect being unbounded: a downstream that
+// completes initialize and then never answers tools/list would otherwise wedge
+// the startup goroutine (and the retry loop) forever. catalogTimeout must turn
+// that into a bounded error.
+func TestCatalogTimeoutBoundsHungToolsList(t *testing.T) {
+	// Not parallel: it shortens the package-level catalogTimeout.
+	old := catalogTimeout
+	catalogTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { catalogTimeout = old })
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	downstream.hangToolsListCalls(true)
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err = mcpClient.addToMCPServer(ctx, mcp.Implementation{Name: "test"}, proxyServer)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("addToMCPServer succeeded despite a tools/list that never answers")
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("addToMCPServer took %v, want it bounded by catalogTimeout", elapsed)
+	}
+}
+
+// Regression for a Client built without Options: newMCPClient permits a nil
+// Options, and the keepalive task used to dereference it directly, panicking as
+// soon as such a client connected. The option accessors are nil-safe, so a
+// successful connection must stay up.
+func TestNilOptionsClientDoesNotPanicOnConnect(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	ctx := t.Context()
+	if err := mcpClient.addToMCPServer(ctx, mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer with nil Options: %v", err)
+	}
+
+	// Let the keepalive task run a tick; a nil dereference there crashes the
+	// process rather than this goroutine.
+	time.Sleep(100 * time.Millisecond)
 }

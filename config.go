@@ -108,6 +108,9 @@ const (
 	// defaultStartupGracePeriod is how long readiness waits for every client to
 	// connect when mcpProxy.startupGracePeriod is unset.
 	defaultStartupGracePeriod = 30 * time.Second
+	// defaultReconnectInterval is the gap between connection attempts while a
+	// downstream is unreachable, when options.reconnectInterval is unset.
+	defaultReconnectInterval = 15 * time.Second
 )
 
 // pingInterval returns the probe period for a server, falling back to the
@@ -126,6 +129,34 @@ func (c *MCPProxyConfigV2) startupGrace() time.Duration {
 		return time.Duration(c.StartupGracePeriod)
 	}
 	return defaultStartupGracePeriod
+}
+
+// reconnectInterval returns the gap between connection attempts for a server,
+// falling back to the default when unset.
+func (o *OptionsV2) reconnectInterval() time.Duration {
+	if o != nil && o.ReconnectInterval > 0 {
+		return time.Duration(o.ReconnectInterval)
+	}
+	return defaultReconnectInterval
+}
+
+// autoReconnect reports whether this server self-heals. It is nil-safe so a
+// Client built without Options (which newMCPClient permits) does not panic in
+// the ping task.
+func (o *OptionsV2) autoReconnect() bool {
+	return o != nil && o.AutoReconnect.OrElse(false)
+}
+
+// panicIfInvalid reports whether a failed start is fatal for the process. It is
+// nil-safe for the same reason as autoReconnect.
+func (o *OptionsV2) panicIfInvalid() bool {
+	return o != nil && o.PanicIfInvalid.OrElse(false)
+}
+
+// logEnabled reports whether request logging is on. It is nil-safe like the two
+// above, so the route setup does not depend on Options having been defaulted.
+func (o *OptionsV2) logEnabled() bool {
+	return o != nil && o.LogEnabled.OrElse(false)
 }
 
 type MCPClientType string
@@ -166,6 +197,16 @@ type OptionsV2 struct {
 	// PingInterval is how often this connection is probed to keep it alive and
 	// to notice that it died; it sets how quickly /_readyz reports degraded.
 	PingInterval Duration `json:"pingInterval,omitempty"`
+	// AutoReconnect makes a downstream self-heal: a server that is unreachable
+	// at startup is retried until it connects (instead of never mounting), and
+	// a connection that drops is rebuilt rather than left degraded. It is off
+	// by default, because the previous behaviour — report the downstream as
+	// unhealthy and let a load balancer route around the proxy — is the safer
+	// default for an orchestrator that restarts the pod. See docs/CONFIGURATION.md.
+	AutoReconnect optional.Field[bool] `json:"autoReconnect"`
+	// ReconnectInterval is the gap between connection attempts while a
+	// downstream is unreachable. Defaults to 15s when unset.
+	ReconnectInterval Duration `json:"reconnectInterval,omitempty"`
 }
 
 type MCPProxyConfigV2 struct {
@@ -302,6 +343,9 @@ func validateOptions(field string, options *OptionsV2) error {
 		return nil
 	}
 	if err := validateDuration(field+".pingInterval", options.PingInterval); err != nil {
+		return err
+	}
+	if err := validateDuration(field+".reconnectInterval", options.ReconnectInterval); err != nil {
 		return err
 	}
 	for i, token := range options.AuthTokens {
@@ -539,6 +583,12 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 		}
 		if clientConfig.Options.PingInterval == 0 {
 			clientConfig.Options.PingInterval = conf.McpProxy.Options.PingInterval
+		}
+		if !clientConfig.Options.AutoReconnect.Present() {
+			clientConfig.Options.AutoReconnect = conf.McpProxy.Options.AutoReconnect
+		}
+		if clientConfig.Options.ReconnectInterval == 0 {
+			clientConfig.Options.ReconnectInterval = conf.McpProxy.Options.ReconnectInterval
 		}
 	}
 

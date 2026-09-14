@@ -312,6 +312,22 @@ func TestDurationOptionDefaults(t *testing.T) {
 	if got := (&MCPProxyConfigV2{StartupGracePeriod: Duration(time.Second)}).startupGrace(); got != time.Second {
 		t.Errorf("configured startupGracePeriod = %v, want 1s", got)
 	}
+	if got := (&OptionsV2{}).reconnectInterval(); got != defaultReconnectInterval {
+		t.Errorf("unset reconnectInterval = %v, want %v", got, defaultReconnectInterval)
+	}
+	if got := (&OptionsV2{ReconnectInterval: Duration(time.Second)}).reconnectInterval(); got != time.Second {
+		t.Errorf("configured reconnectInterval = %v, want 1s", got)
+	}
+}
+
+// Auto-reconnect is opt-in: the default has to stay fail-once, because the
+// health endpoints exist precisely so an orchestrator can restart the proxy.
+func TestAutoReconnectDefaultsOff(t *testing.T) {
+	t.Parallel()
+
+	if (&OptionsV2{}).AutoReconnect.OrElse(false) {
+		t.Error("autoReconnect must default to false")
+	}
 }
 
 // The timeout used to be parsed but never applied to sse clients.
@@ -355,14 +371,16 @@ func TestLoadInheritsProxyOptions(t *testing.T) {
 			"options": {
 				"authTokens": ["shared"],
 				"logEnabled": true,
-				"pingInterval": "5s"
+				"pingInterval": "5s",
+				"autoReconnect": true,
+				"reconnectInterval": "1s"
 			}
 		},
 		"mcpServers": {
 			"inherits": {"command": "server"},
 			"overrides": {
 				"command": "server",
-				"options": {"authTokens": ["own"], "pingInterval": "1s"}
+				"options": {"authTokens": ["own"], "pingInterval": "1s", "autoReconnect": false, "reconnectInterval": "2s"}
 			}
 		}
 	}`)
@@ -402,5 +420,20 @@ func TestLoadInheritsProxyOptions(t *testing.T) {
 	}
 	if got := overrides.pingInterval(); got != time.Second {
 		t.Errorf("overridden pingInterval = %v, want 1s", got)
+	}
+
+	// autoReconnect and reconnectInterval inherit like the other options, and
+	// an explicit per-server value wins.
+	if !inherits.AutoReconnect.Present() || !inherits.AutoReconnect.OrElse(false) {
+		t.Error("inherited autoReconnect = false, want true")
+	}
+	if got := inherits.reconnectInterval(); got != time.Second {
+		t.Errorf("inherited reconnectInterval = %v, want 1s", got)
+	}
+	if overrides.AutoReconnect.OrElse(true) {
+		t.Error("overridden autoReconnect = true, want false")
+	}
+	if got := overrides.reconnectInterval(); got != 2*time.Second {
+		t.Errorf("overridden reconnectInterval = %v, want 2s", got)
 	}
 }
