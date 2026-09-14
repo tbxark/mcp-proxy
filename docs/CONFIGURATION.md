@@ -188,6 +188,12 @@ looking, from the logs, like a refresh failure with no obvious cause.
   would hide the failure. Ignored when `panicIfInvalid` is true, which keeps failing fast.
 - `reconnectInterval` (duration string, default `"15s"`): gap between attempts while a
   downstream with `autoReconnect` is unreachable. Only meaningful with `autoReconnect`.
+  It applies to the **startup** retry loop, not to a connection that drops later: a drop
+  is discovered by the keepalive probe and rebuilt in place, so its recovery time is
+  governed by `pingInterval` (the probe period) and the consecutive-failure threshold,
+  not by `reconnectInterval`. With the defaults (30s probe, three failures) a dropped
+  connection recovers in roughly 90s plus connect time; shorten `pingInterval` to recover
+  faster.
 
 Notes:
 

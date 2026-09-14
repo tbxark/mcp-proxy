@@ -79,6 +79,12 @@ and mounts its route once it connects, and it rebuilds a connection that drops.
 This trades the external-restart contract for in-process recovery, which suits a
 host where the proxy outlives the app it fronts (e.g. started at login).
 
+The two cases use different timings. A backend that was never up is retried on
+`reconnectInterval`. A connection that drops after being healthy is noticed by the
+keepalive probe instead, so its recovery is governed by `pingInterval` and the
+three-consecutive-failure threshold — about 90s with the defaults. Lower
+`pingInterval` to detect and rebuild a drop sooner.
+
 These endpoints never require the proxy auth token, which also means the
 `unhealthy` list exposes your server names to anyone who can reach the port.
 Bind the proxy to an internal address, or keep the health endpoints on an
