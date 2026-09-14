@@ -481,3 +481,61 @@ func TestAutoReconnectOffStillLogsStartupError(t *testing.T) {
 		t.Errorf("autoReconnect is off, so nothing should be retried\n%s", logs)
 	}
 }
+
+// A downstream that requires interactive OAuth can never connect on its own, so
+// autoReconnect must stop retrying it and say so once, rather than hammering the
+// provider every interval forever. The proxy acts as an OAuth client here, so a
+// 401 with a resource_metadata challenge surfaces as an OAuth authorization
+// error (surfaced through oauthAwareError).
+func TestAutoReconnectStopsOnPermanentAuthError(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	var metadataURL string
+	secured := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=%q", metadataURL))
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(secured.Close)
+	metadataURL = secured.URL + "/.well-known/oauth-protected-resource"
+
+	addr := freeAddr(t)
+	configPath := writeConfig(t, fmt.Sprintf(`{
+  "mcpProxy": {
+    "baseURL": "http://%[1]s", "addr": "%[1]s", "name": "p", "version": "1",
+    "type": "streamable-http", "startupGracePeriod": "1s"
+  },
+  "mcpServers": {
+    "secured": {
+      "transportType": "streamable-http",
+      "url": "%[2]s/mcp",
+      "oauth": {"clientId": "x", "clientSecret": "y"},
+      "options": {"autoReconnect": true, "reconnectInterval": "100ms"}
+    }
+  }
+}`, addr, secured.URL))
+
+	proxy := launchProxy(t, configPath, addr)
+
+	// Wait for the proxy to be serving, then give the loop several intervals to
+	// prove it did not retry.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if code, _ := proxy.ready(t); code != 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(1 * time.Second)
+
+	logs := proxy.stderr.String()
+	if got := strings.Count(logs, "cannot connect without intervention"); got != 1 {
+		t.Errorf("intervention notice logged %d times, want exactly 1\n%s", got, logs)
+	}
+	if got := strings.Count(logs, "Retrying connection"); got != 0 {
+		t.Errorf("a permanent auth failure was retried %d times, want 0\n%s", got, logs)
+	}
+	if !strings.Contains(logs, "mcp-proxy -authorize") {
+		t.Errorf("the failure did not carry the actionable authorize hint\n%s", logs)
+	}
+}
