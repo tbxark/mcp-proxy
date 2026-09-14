@@ -177,7 +177,7 @@ type readinessReport struct {
 // the retry line carries the detail). Logging here unconditionally would emit
 // an ERROR for every retry attempt of a backend that is simply not up yet.
 func fatalStartupError(clientConfig *MCPClientConfigV2, err error) error {
-	if clientConfig.Options.PanicIfInvalid.OrElse(false) {
+	if clientConfig.Options.panicIfInvalid() {
 		return err
 	}
 	return nil
@@ -273,7 +273,7 @@ func startHTTPServer(config *Config) error {
 				// and the logger records requests that auth rejects.
 				middlewares := make([]MiddlewareFunc, 0)
 				middlewares = append(middlewares, recoverMiddleware(name))
-				if clientConfig.Options.LogEnabled.OrElse(false) {
+				if clientConfig.Options.logEnabled() {
 					middlewares = append(middlewares, loggerMiddleware(name))
 				}
 				if len(clientConfig.Options.AuthTokens) > 0 {
@@ -299,7 +299,7 @@ func startHTTPServer(config *Config) error {
 
 		errorGroup.Go(func() error {
 			slog.Info("Connecting", "client", name)
-			autoReconnect := clientConfig.Options.AutoReconnect.OrElse(false)
+			autoReconnect := clientConfig.Options.autoReconnect()
 			interval := clientConfig.Options.reconnectInterval()
 
 			var (

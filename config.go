@@ -140,6 +140,25 @@ func (o *OptionsV2) reconnectInterval() time.Duration {
 	return defaultReconnectInterval
 }
 
+// autoReconnect reports whether this server self-heals. It is nil-safe so a
+// Client built without Options (which newMCPClient permits) does not panic in
+// the ping task.
+func (o *OptionsV2) autoReconnect() bool {
+	return o != nil && o.AutoReconnect.OrElse(false)
+}
+
+// panicIfInvalid reports whether a failed start is fatal for the process. It is
+// nil-safe for the same reason as autoReconnect.
+func (o *OptionsV2) panicIfInvalid() bool {
+	return o != nil && o.PanicIfInvalid.OrElse(false)
+}
+
+// logEnabled reports whether request logging is on. It is nil-safe like the two
+// above, so the route setup does not depend on Options having been defaulted.
+func (o *OptionsV2) logEnabled() bool {
+	return o != nil && o.LogEnabled.OrElse(false)
+}
+
 type MCPClientType string
 
 const (

@@ -438,7 +438,7 @@ func (c *Client) startPingTask(ctx context.Context) {
 	ticker := time.NewTicker(c.options.pingInterval())
 	defer ticker.Stop()
 
-	autoReconnect := c.options.AutoReconnect.OrElse(false)
+	autoReconnect := c.options.autoReconnect()
 	failCount := 0
 	for {
 		select {
