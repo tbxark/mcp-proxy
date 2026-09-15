@@ -127,7 +127,7 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 			return authErr
 		}
 		if err := mcpClient.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start client after authorization: %w", err)
+			return fmt.Errorf("failed to start client after authorization: %w", redactURLCredentials(err))
 		}
 	}
 
@@ -139,7 +139,7 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 			return authErr
 		}
 		if _, err := mcpClient.Initialize(ctx, initRequest); err != nil {
-			return fmt.Errorf("failed to initialize after authorization: %w", err)
+			return fmt.Errorf("failed to initialize after authorization: %w", redactURLCredentials(err))
 		}
 	}
 
@@ -148,10 +148,11 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 }
 
 // authorizeInteractively runs the browser + local-callback OAuth dance if
-// err indicates authorization is required; otherwise it returns err as-is.
+// err indicates authorization is required; otherwise it returns err (redacted,
+// since a transport error embeds the downstream URL) as-is.
 func authorizeInteractively(ctx context.Context, err error, serverName, redirectURI string) error {
 	if !client.IsOAuthAuthorizationRequiredError(err) {
-		return err
+		return redactURLCredentials(err)
 	}
 	oauthHandler := client.GetOAuthHandler(err)
 
@@ -228,34 +229,38 @@ func oauthAwareError(serverName string, err error) error {
 }
 
 func parseRedirectURI(redirectURI string) (path string, addr string, err error) {
+	// Echo a redacted form: this error is printed and logged, and the URI could
+	// carry a credential in its userinfo or query. A URL that does not parse is
+	// replaced entirely, since its raw text cannot be redacted reliably.
+	display := redactURLString(redirectURI)
 	u, err := url.Parse(redirectURI)
 	if err != nil {
-		return "", "", fmt.Errorf("invalid redirect URI %q: %w", redirectURI, err)
+		return "", "", fmt.Errorf("invalid redirect URI %q", display)
 	}
 	if u.Scheme != "http" {
-		return "", "", fmt.Errorf("redirect URI %q must use http", redirectURI)
+		return "", "", fmt.Errorf("redirect URI %q must use http", display)
 	}
 	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return "", "", fmt.Errorf("redirect URI %q cannot contain user info, query, or fragment", redirectURI)
+		return "", "", fmt.Errorf("redirect URI %q cannot contain user info, query, or fragment", display)
 	}
 	hostname := u.Hostname()
 	if hostname == "" {
-		return "", "", fmt.Errorf("redirect URI %q must include a host", redirectURI)
+		return "", "", fmt.Errorf("redirect URI %q must include a host", display)
 	}
 	ip := net.ParseIP(hostname)
 	if !strings.EqualFold(hostname, "localhost") && (ip == nil || !ip.IsLoopback()) {
-		return "", "", fmt.Errorf("redirect URI %q must use localhost or a loopback IP", redirectURI)
+		return "", "", fmt.Errorf("redirect URI %q must use localhost or a loopback IP", display)
 	}
 	port := u.Port()
 	if port == "" {
-		return "", "", fmt.Errorf("redirect URI %q must include an explicit port", redirectURI)
+		return "", "", fmt.Errorf("redirect URI %q must include an explicit port", display)
 	}
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return "", "", fmt.Errorf("redirect URI %q contains an invalid port", redirectURI)
+		return "", "", fmt.Errorf("redirect URI %q contains an invalid port", display)
 	}
 	if u.Path == "" || u.Path == "/" {
-		return "", "", fmt.Errorf("redirect URI %q must include a callback path", redirectURI)
+		return "", "", fmt.Errorf("redirect URI %q must include a callback path", display)
 	}
 	return u.Path, net.JoinHostPort(hostname, port), nil
 }

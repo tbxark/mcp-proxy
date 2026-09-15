@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	nethttp "net/http"
 	"net/url"
 	"path"
@@ -330,7 +331,12 @@ func validateDuration(field string, d Duration) error {
 func validateHTTPURL(field, rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("%s is invalid: %w", field, err)
+		// Keep the original "is invalid" wording for compatibility, but do not
+		// echo the URL or the parser's reason. net/url truncates a malformed URL
+		// at the first '#', after which a credential can look like a port
+		// ("https://user:SECRET#frag@h/p" yields `invalid port ":SECRET"`), so
+		// neither the URL nor the reason can be redacted reliably.
+		return fmt.Errorf("%s is invalid: the value is not a parseable URL", field)
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("%s must be an absolute http(s) URL", field)
@@ -447,6 +453,15 @@ func validateConfig(config *Config) error {
 		if serverConfig.URL != "" {
 			if err := validateHTTPURL(field+".url", serverConfig.URL); err != nil {
 				return err
+			}
+			// A URL-query credential is redacted from the proxy's own errors
+			// and logs, but it also passes through the mcp-go transports and
+			// can surface in theirs, and it lands in access logs. Warn (never
+			// reject: some servers, like the amap example, only accept a token
+			// this way) so the operator knows to prefer headers when possible.
+			if u, err := url.Parse(serverConfig.URL); err == nil && u.RawQuery != "" {
+				slog.Warn("Downstream URL contains a query string; prefer credentials in headers when the server supports them, since a query credential can appear in transport errors and access logs",
+					"server", name, "field", field+".url")
 			}
 		}
 		if err := validateOptions(field+".options", serverConfig.Options); err != nil {

@@ -175,6 +175,19 @@ func checkOAuthToken(res *doctorResult, name string) {
 	}
 
 	hasRefresh := token.RefreshToken != ""
+	// An empty access token is not usable, and the daemon enforces exactly that
+	// (mcp-go's getValidToken requires a non-empty AccessToken). Without this
+	// check the diagnostic reported "ok" for a credential the daemon refuses to
+	// mount, so -auth-status exited 0 on a route that could not connect.
+	if token.AccessToken == "" {
+		res.ok = false
+		if hasRefresh {
+			res.status = "MISSING ACCESS TOKEN (no access token; has refresh token, daemon restart or -doctor may refresh it)"
+		} else {
+			res.status = fmt.Sprintf("MISSING ACCESS TOKEN (no access token; re-run: mcp-proxy -authorize %s -config <path>)", name)
+		}
+		return
+	}
 	switch {
 	case token.IsExpired():
 		age := time.Since(token.ExpiresAt).Round(time.Minute)
@@ -199,7 +212,7 @@ func checkServerLive(res *doctorResult, conf *MCPClientConfigV2) {
 	mcpClient, err := newMCPClient(res.name, conf)
 	if err != nil {
 		res.ok = false
-		res.live = fmt.Sprintf("FAILED: %v", err)
+		res.live = fmt.Sprintf("FAILED: %v", redactURLCredentials(err))
 		return
 	}
 	defer func() { _ = mcpClient.Close() }()
@@ -232,7 +245,10 @@ func liveFailureMessage(name string, err error) string {
 	if client.IsOAuthAuthorizationRequiredError(err) {
 		return fmt.Sprintf("NOT AUTHORIZED (run: mcp-proxy -authorize %s -config <path>)", name)
 	}
-	return fmt.Sprintf("FAILED: %v", err)
+	// A transport failure embeds the downstream URL, which may carry a
+	// credential in its query; the LIVE column is printed (and often pasted
+	// into a report), so redact it like the daemon log does.
+	return fmt.Sprintf("FAILED: %v", redactURLCredentials(err))
 }
 
 func printDoctorReport(results []doctorResult, live bool) {

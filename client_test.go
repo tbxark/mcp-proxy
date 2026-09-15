@@ -197,6 +197,16 @@ type rawDownstream struct {
 	tools          []string
 	hangToolsList  bool
 	toolsListCalls int
+
+	// Optional descriptor/metadata controls. Zero values preserve the original
+	// empty-catalog behaviour.
+	toolExecution     map[string]any   // attached to every listed tool when set
+	resourceTemplates []map[string]any // raw templates; []any{} when nil
+	prompts           []string         // prompt names; none when nil
+	resources         []string         // resource URIs; none when nil
+	hangMethods       map[string]bool  // methods that accept and never answer
+
+	server *httptest.Server
 }
 
 func newRawDownstream(t *testing.T) *rawDownstream {
@@ -225,6 +235,11 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 			return
 		}
 
+		if d.shouldHang(req.Method) {
+			<-r.Context().Done()
+			return
+		}
+
 		writeResult := func(result any) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -246,6 +261,7 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 			d.toolsListCalls++
 			hang := d.hangToolsList
 			names := slices.Clone(d.tools)
+			execution := d.toolExecution
 			d.mu.Unlock()
 			if hang {
 				<-r.Context().Done()
@@ -253,18 +269,42 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 			}
 			tools := make([]map[string]any, 0, len(names))
 			for _, name := range names {
-				tools = append(tools, map[string]any{
+				tool := map[string]any{
 					"name":        name,
 					"inputSchema": map[string]any{"type": "object"},
-				})
+				}
+				if execution != nil {
+					tool["execution"] = execution
+				}
+				tools = append(tools, tool)
 			}
 			writeResult(map[string]any{"tools": tools})
 		case "prompts/list":
-			writeResult(map[string]any{"prompts": []any{}})
+			d.mu.Lock()
+			names := slices.Clone(d.prompts)
+			d.mu.Unlock()
+			prompts := make([]map[string]any, 0, len(names))
+			for _, name := range names {
+				prompts = append(prompts, map[string]any{"name": name})
+			}
+			writeResult(map[string]any{"prompts": prompts})
 		case "resources/list":
-			writeResult(map[string]any{"resources": []any{}})
+			d.mu.Lock()
+			uris := slices.Clone(d.resources)
+			d.mu.Unlock()
+			resources := make([]map[string]any, 0, len(uris))
+			for _, uri := range uris {
+				resources = append(resources, map[string]any{"uri": uri, "name": uri})
+			}
+			writeResult(map[string]any{"resources": resources})
 		case "resources/templates/list":
-			writeResult(map[string]any{"resourceTemplates": []any{}})
+			d.mu.Lock()
+			templates := d.resourceTemplates
+			d.mu.Unlock()
+			if templates == nil {
+				templates = []map[string]any{}
+			}
+			writeResult(map[string]any{"resourceTemplates": templates})
 		default:
 			writeResult(map[string]any{})
 		}
@@ -272,7 +312,14 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 	s := httptest.NewServer(handler)
 	t.Cleanup(s.Close)
 	d.url = s.URL
+	d.server = s
 	return d
+}
+
+func (d *rawDownstream) shouldHang(method string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.hangMethods[method]
 }
 
 func (d *rawDownstream) setTools(names ...string) {
@@ -281,10 +328,54 @@ func (d *rawDownstream) setTools(names ...string) {
 	d.tools = slices.Clone(names)
 }
 
+func (d *rawDownstream) setPrompts(names ...string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.prompts = slices.Clone(names)
+}
+
+func (d *rawDownstream) setResources(uris ...string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.resources = slices.Clone(uris)
+}
+
+func (d *rawDownstream) setToolExecution(execution map[string]any) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.toolExecution = execution
+}
+
+func (d *rawDownstream) setResourceTemplates(templates ...map[string]any) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.resourceTemplates = slices.Clone(templates)
+}
+
+func (d *rawDownstream) hangMethodsNamed(methods ...string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.hangMethods = make(map[string]bool, len(methods))
+	for _, method := range methods {
+		d.hangMethods[method] = true
+	}
+}
+
 func (d *rawDownstream) hangToolsListCalls(hang bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.hangToolsList = hang
+}
+
+// close shuts the fake downstream down, so a test can observe how a transport
+// failure is reported (the URL in the error includes any configured query).
+func (d *rawDownstream) close() {
+	d.mu.Lock()
+	server := d.server
+	d.mu.Unlock()
+	if server != nil {
+		server.Close()
+	}
 }
 
 // serverToolNames reads back the tools registered on the proxy-side server.

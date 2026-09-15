@@ -53,8 +53,7 @@ func TestCheckServerAuthNoAuth(t *testing.T) {
 }
 
 func TestCheckServerAuthOAuth(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", dir)
+	isolateUserConfigDir(t)
 
 	conf := &MCPClientConfigV2{
 		URL:   "https://mcp.example.com/mcp",
@@ -112,8 +111,7 @@ func writeTestToken(t *testing.T, serverName string, token *transport.Token) {
 }
 
 func TestRunDoctorSkipsDisabledServers(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", dir)
+	dir := isolateUserConfigDir(t)
 
 	configPath := dir + "/config.json"
 	if err := os.WriteFile(configPath, []byte(`{
@@ -135,7 +133,7 @@ func TestRunDoctorSkipsDisabledServers(t *testing.T) {
 }
 
 func TestDoctorUpdatesAuthStatusAfterTokenRefresh(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	isolateUserConfigDir(t)
 	mcpServer := server.NewStreamableHTTPServer(server.NewMCPServer("test", "1.0"))
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

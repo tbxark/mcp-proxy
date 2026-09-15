@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os/exec"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -280,15 +282,38 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 	catalogCtx, cancelCatalog := context.WithTimeout(ctx, catalogTimeout)
 	defer cancelCatalog()
 
-	if err := c.addToolsToServer(catalogCtx, mcpServer); err != nil {
+	// Catalog registration copies descriptors that a downstream controls, so it
+	// runs through the panic-guarded helper below: a future shape this code does
+	// not anticipate must cost that backend its own route, not terminate the
+	// process that serves every route.
+	if err := c.registerCatalogSafely(func() error {
+		return c.addToolsToServer(catalogCtx, mcpServer)
+	}); err != nil {
 		return err
 	}
-	_ = c.addPromptsToServer(catalogCtx, mcpServer)
-	_ = c.addResourcesToServer(catalogCtx, mcpServer)
-	_ = c.addResourceTemplatesToServer(catalogCtx, mcpServer)
+	_ = c.registerCatalogSafely(func() error {
+		_ = c.addPromptsToServer(catalogCtx, mcpServer)
+		_ = c.addResourcesToServer(catalogCtx, mcpServer)
+		_ = c.addResourceTemplatesToServer(catalogCtx, mcpServer)
+		return nil
+	})
 
 	c.health.Store(int32(healthOK))
 	return nil
+}
+
+// registerCatalogSafely runs fn and converts a panic caused by
+// downstream-supplied catalog data into an error, so a malformed descriptor
+// cannot take down the shared process before it serves any route.
+func (c *Client) registerCatalogSafely(fn func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Recovered from panic while registering downstream catalog",
+				"client", c.name, "err", r, "stack", string(debug.Stack()))
+			err = fmt.Errorf("downstream catalog registration panicked: %v", r)
+		}
+	}()
+	return fn()
 }
 
 // forget drops a transport that failed to establish, so the next attempt
@@ -323,6 +348,95 @@ func (c *Client) reconnect(ctx context.Context) error {
 	return c.connect(ctx, c.clientInfo, c.mcpServer)
 }
 
+// withRequestTimeout bounds ctx by the configured per-request timeout when one
+// is set (stdio only), so every forwarded method - not just tool calls - can
+// abandon a stalled request instead of occupying the single shared channel.
+func (c *Client) withRequestTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.requestTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.requestTimeout)
+}
+
+// redactedError keeps the original error reachable through Unwrap while
+// exposing a message with URL secrets removed.
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.err }
+
+// redactedURLPlaceholder stands in for a URL that could not be parsed. Raw
+// text cannot be redacted reliably in that case: net/url hands back a string
+// truncated at the first '#' (so a credential can look like the host or a
+// port), and there is no way to tell a port from a truncated password. The
+// only safe option is to not echo the input at all.
+const redactedURLPlaceholder = "<redacted-url>"
+
+// redactURLString returns a display form of raw with userinfo, query, and
+// fragment removed. A string that does not parse as a URL is replaced entirely
+// by redactedURLPlaceholder, because no part of it can be trusted.
+func redactURLString(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return redactedURLPlaceholder
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.String()
+}
+
+// redactURLCredentials removes userinfo, query, and fragment values from any
+// *url.Error in the chain. A downstream credential may be configured in the
+// URL query (docs/CONFIGURATION.md documents that form), and Go's url.Error
+// embeds the whole URL in its message while redacting only the userinfo
+// password - so without this the proxy's own downstream secret would reach
+// callers through a JSON-RPC error and the daemon log. errors.As still finds
+// the wrapped transport.Error, so failure classification is unaffected.
+func redactURLCredentials(err error) error {
+	if err == nil {
+		return nil
+	}
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	if urlErr.Err == nil {
+		return err
+	}
+	safe := redactURLString(urlErr.URL)
+	if safe == urlErr.URL {
+		// Nothing to redact (no userinfo, query, or fragment).
+		return err
+	}
+	if safe == redactedURLPlaceholder {
+		// The URL did not parse. Its raw text can also have contaminated the
+		// reason - net/url reports a truncated credential as a port - so drop
+		// the reason as well rather than half-redact the message.
+		return &redactedError{msg: fmt.Sprintf("%s %s", urlErr.Op, redactedURLPlaceholder), err: err}
+	}
+	// Replace the RENDERED form of the url.Error, not the raw URL: url.Error
+	// renders its URL with %q, so a credential containing a quote or backslash
+	// does not appear verbatim in the message and a raw-URL replacement would
+	// silently leave it in place.
+	rawRendered := (&url.Error{Op: urlErr.Op, URL: urlErr.URL, Err: urlErr.Err}).Error()
+	redactedRendered := (&url.Error{Op: urlErr.Op, URL: safe, Err: urlErr.Err}).Error()
+	message := strings.ReplaceAll(err.Error(), rawRendered, redactedRendered)
+	if message == err.Error() {
+		// The wrapper did not render the url.Error verbatim; fall back to the
+		// raw URL, which covers the remaining shapes.
+		message = strings.ReplaceAll(err.Error(), urlErr.URL, safe)
+	}
+	return &redactedError{msg: message, err: err}
+}
+
 // callTool forwards a tool call to the downstream, bounded by requestTimeout
 // when one is configured.
 //
@@ -339,12 +453,10 @@ func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mc
 	if cl == nil {
 		return nil, errors.New("downstream is not connected")
 	}
-	if c.requestTimeout <= 0 {
-		return cl.CallTool(ctx, request)
-	}
-	callCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
+	callCtx, cancel := c.withRequestTimeout(ctx)
 	defer cancel()
-	return cl.CallTool(callCtx, request)
+	result, err := cl.CallTool(callCtx, request)
+	return result, redactURLCredentials(err)
 }
 
 // drainStderr keeps reading a stdio subprocess's stderr for as long as it runs.
@@ -464,7 +576,7 @@ func (c *Client) startPingTask(ctx context.Context) {
 				// A downstream that answers with a JSON-RPC error is alive - it
 				// may simply not implement the probe. Only a broken connection
 				// counts against it.
-				slog.Debug("MCP health probe answered with an error, treating as alive", "client", c.name, "err", err)
+				slog.Debug("MCP health probe answered with an error, treating as alive", "client", c.name, "err", redactURLCredentials(err))
 				if failCount > 0 {
 					slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
 					failCount = 0
@@ -474,7 +586,7 @@ func (c *Client) startPingTask(ctx context.Context) {
 			}
 
 			failCount++
-			slog.Warn("MCP health probe failed", "client", c.name, "err", err, "failures", failCount)
+			slog.Warn("MCP health probe failed", "client", c.name, "err", redactURLCredentials(err), "failures", failCount)
 			if failCount < pingFailureThreshold {
 				continue
 			}
@@ -488,7 +600,7 @@ func (c *Client) startPingTask(ctx context.Context) {
 			// using the old one until the new one is ready.
 			rErr := c.reconnect(ctx)
 			if rErr != nil {
-				slog.Warn("Failed to reconnect downstream", "client", c.name, "err", rErr)
+				slog.Warn("Failed to reconnect downstream", "client", c.name, "err", redactURLCredentials(rErr))
 				continue
 			}
 			slog.Info("Reconnected downstream", "client", c.name, "afterFailures", failCount)
@@ -498,39 +610,55 @@ func (c *Client) startPingTask(ctx context.Context) {
 	}
 }
 
+// toolFilterFunc builds the tool exposure predicate for one client.
+//
+// Behavior is deliberately unchanged from earlier releases so an upgrade cannot
+// start hiding tools a deployment relies on: a filter only takes effect when it
+// has a non-empty list (so an empty list means "no filtering", including
+// mode=allow), and an unrecognized mode skips filtering. Both cases log a
+// warning so an inert or over-broad filter is not silent.
+func toolFilterFunc(name string, options *OptionsV2) func(string) bool {
+	if options == nil || options.ToolFilter == nil {
+		return func(string) bool { return true }
+	}
+	filterSet := make(map[string]struct{}, len(options.ToolFilter.List))
+	for _, toolName := range options.ToolFilter.List {
+		filterSet[toolName] = struct{}{}
+	}
+	switch mode := ToolFilterMode(strings.ToLower(string(options.ToolFilter.Mode))); mode {
+	case ToolFilterModeAllow:
+		if len(filterSet) == 0 {
+			slog.Warn("toolFilter mode=allow with an empty list exposes every tool; list the tools to expose, or use mode=block",
+				"client", name)
+			return func(string) bool { return true }
+		}
+		return func(toolName string) bool {
+			_, inList := filterSet[toolName]
+			if !inList {
+				slog.Debug("Ignoring tool not in allow list", "client", name, "tool", toolName)
+			}
+			return inList
+		}
+	case ToolFilterModeBlock:
+		return func(toolName string) bool {
+			_, inList := filterSet[toolName]
+			if inList {
+				slog.Debug("Ignoring tool in block list", "client", name, "tool", toolName)
+			}
+			return !inList
+		}
+	default:
+		// validateConfig rejects unknown modes, so this only happens for a
+		// programmatically built config. Preserve the historical behavior (no
+		// filtering) but make it visible.
+		slog.Warn("Unknown tool filter mode, skipping tool filter", "client", name, "mode", mode)
+		return func(string) bool { return true }
+	}
+}
+
 func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServer) error {
 	toolsRequest := mcp.ListToolsRequest{}
-	filterFunc := func(toolName string) bool {
-		return true
-	}
-
-	if c.options != nil && c.options.ToolFilter != nil && len(c.options.ToolFilter.List) > 0 {
-		filterSet := make(map[string]struct{})
-		mode := ToolFilterMode(strings.ToLower(string(c.options.ToolFilter.Mode)))
-		for _, toolName := range c.options.ToolFilter.List {
-			filterSet[toolName] = struct{}{}
-		}
-		switch mode {
-		case ToolFilterModeAllow:
-			filterFunc = func(toolName string) bool {
-				_, inList := filterSet[toolName]
-				if !inList {
-					slog.Debug("Ignoring tool not in allow list", "client", c.name, "tool", toolName)
-				}
-				return inList
-			}
-		case ToolFilterModeBlock:
-			filterFunc = func(toolName string) bool {
-				_, inList := filterSet[toolName]
-				if inList {
-					slog.Debug("Ignoring tool in block list", "client", c.name, "tool", toolName)
-				}
-				return !inList
-			}
-		default:
-			slog.Warn("Unknown tool filter mode, skipping tool filter", "client", c.name, "mode", mode)
-		}
-	}
+	filterFunc := toolFilterFunc(c.name, c.options)
 
 	cl := c.getClient()
 	if cl == nil {
@@ -558,6 +686,13 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 				continue
 			}
 			slog.Debug("Adding tool", "client", c.name, "tool", tool.Name)
+			// The proxy implements no tasks/* handling (newMCPServer never
+			// enables task capabilities), so a peer-declared execution mode must
+			// not select a dispatcher path the route server cannot honour: it
+			// would let a plain tools/call be refused, or be accepted as a task
+			// whose result can never be read or cancelled. Drop the
+			// downstream-supplied execution metadata before republishing.
+			tool.Execution = nil
 			toolName := tool.Name
 			tools = append(tools, server.ServerTool{Tool: tool, Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 				result, err := c.callTool(ctx, request)
@@ -603,13 +738,19 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 		for _, prompt := range listed.Prompts {
 			slog.Debug("Adding prompt", "client", c.name, "prompt", prompt.Name)
 			// Resolve the live client at call time so a reconnect is
-			// transparent to the handler.
+			// transparent to the handler. The per-request bound is applied here
+			// too: a stdio downstream shares one pipe for every request, so an
+			// unanswered prompt wedges the whole route exactly as an unanswered
+			// tool call would.
 			prompts = append(prompts, server.ServerPrompt{Prompt: prompt, Handler: func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
 				live := c.getClient()
 				if live == nil {
 					return nil, errors.New("downstream is not connected")
 				}
-				return live.GetPrompt(ctx, request)
+				callCtx, cancel := c.withRequestTimeout(ctx)
+				defer cancel()
+				result, err := live.GetPrompt(callCtx, request)
+				return result, redactURLCredentials(err)
 			}})
 		}
 		if listed.NextCursor == "" {
@@ -677,6 +818,15 @@ func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *se
 		}
 		slog.Debug("Successfully listed resource templates", "client", c.name, "count", len(listed.ResourceTemplates))
 		for _, resourceTemplate := range listed.ResourceTemplates {
+			// A downstream that omits uriTemplate (or sends null) decodes to a
+			// nil URITemplate, which mcp-go dereferences when it builds the
+			// catalog key (entry.Template.URITemplate.Raw()). Registering it
+			// panics the whole proxy - the shared process serves every route -
+			// so a template without a usable URI template is skipped instead.
+			if resourceTemplate.URITemplate == nil || resourceTemplate.URITemplate.Raw() == "" {
+				slog.Warn("Skipping resource template without a uriTemplate", "client", c.name, "template", resourceTemplate.Name)
+				continue
+			}
 			slog.Debug("Adding resource template", "client", c.name, "template", resourceTemplate.Name)
 			resourceTemplates = append(resourceTemplates, server.ServerResourceTemplate{Template: resourceTemplate, Handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 				return c.readResource(ctx, request)
@@ -692,15 +842,19 @@ func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *se
 }
 
 // readResource resolves the live client at call time so a reconnect is
-// transparent to the handler.
+// transparent to the handler. Like callTool it applies the configured
+// per-request bound: an unanswered resource read occupies the single stdio
+// channel and takes the whole downstream unhealthy for every caller.
 func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 	cl := c.getClient()
 	if cl == nil {
 		return nil, errors.New("downstream is not connected")
 	}
-	readResource, err := cl.ReadResource(ctx, request)
+	callCtx, cancel := c.withRequestTimeout(ctx)
+	defer cancel()
+	readResource, err := cl.ReadResource(callCtx, request)
 	if err != nil {
-		return nil, err
+		return nil, redactURLCredentials(err)
 	}
 	return readResource.Contents, nil
 }

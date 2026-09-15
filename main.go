@@ -36,7 +36,7 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
 	if *authorize != "" {
 		if err := runAuthorize(*conf, *authorize, *insecure, *expandEnv, *httpHeaders, *httpTimeout); err != nil {
-			slog.Error("Failed to authorize server", "server", *authorize, "err", err)
+			slog.Error("Failed to authorize server", "server", *authorize, "err", redactURLCredentials(err))
 			os.Exit(1)
 		}
 		return
@@ -44,7 +44,7 @@ func main() {
 	if *authStatus || *doctor {
 		ok, err := runDoctor(*conf, *insecure, *expandEnv, *httpHeaders, *httpTimeout, *doctor)
 		if err != nil {
-			slog.Error("Failed to run doctor", "err", err)
+			slog.Error("Failed to run doctor", "err", redactURLCredentials(err))
 			os.Exit(1)
 		}
 		if !ok {
@@ -54,7 +54,7 @@ func main() {
 	}
 	config, err := load(*conf, *insecure, *expandEnv, *httpHeaders, *httpTimeout)
 	if err != nil {
-		slog.Error("Failed to load config", "err", err)
+		slog.Error("Failed to load config", "err", redactURLCredentials(err))
 		os.Exit(1)
 	}
 	if *checkConfig {
@@ -63,7 +63,7 @@ func main() {
 	}
 	err = startHTTPServer(config)
 	if err != nil {
-		slog.Error("Failed to start server", "err", err)
+		slog.Error("Failed to start server", "err", redactURLCredentials(err))
 		os.Exit(1)
 	}
 }

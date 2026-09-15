@@ -177,9 +177,13 @@ type readinessReport struct {
 // the failure is terminal (log an error) or about to be retried (log nothing;
 // the retry line carries the detail). Logging here unconditionally would emit
 // an ERROR for every retry attempt of a backend that is simply not up yet.
+//
+// The returned error is redacted, because it is propagated out of the startup
+// errorGroup and logged by main: a transport error embeds the downstream URL,
+// which may carry a credential in its query.
 func fatalStartupError(clientConfig *MCPClientConfigV2, err error) error {
 	if clientConfig.Options.panicIfInvalid() {
-		return err
+		return redactURLCredentials(err)
 	}
 	return nil
 }
@@ -188,7 +192,7 @@ func fatalStartupError(clientConfig *MCPClientConfigV2, err error) error {
 // not be retried, so the rest of the proxy still serves. It returns err when
 // panicIfInvalid makes the failure fatal for the whole process.
 func clientStartupError(name string, clientConfig *MCPClientConfigV2, err error) error {
-	slog.Error("Failed to start client", "client", name, "err", err)
+	slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
 	return fatalStartupError(clientConfig, err)
 }
 
@@ -221,7 +225,9 @@ func retryWait(ctx context.Context, interval time.Duration) bool {
 func startHTTPServer(config *Config) error {
 	baseURL, uErr := url.Parse(config.McpProxy.BaseURL)
 	if uErr != nil {
-		return uErr
+		// baseURL is validated in validateConfig, so this is belt-and-braces;
+		// redact anyway since the parse error embeds the URL.
+		return redactURLCredentials(uErr)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -331,14 +337,14 @@ func startHTTPServer(config *Config) error {
 						// failure that ends the attempt, and stay quiet on the
 						// retry path (an unreachable backend is not an error).
 						if fatal := fatalStartupError(clientConfig, err); fatal != nil {
-							slog.Error("Failed to start client", "client", name, "err", err)
+							slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
 							return fatal
 						}
 						if !autoReconnect {
-							slog.Error("Failed to start client", "client", name, "err", err)
+							slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
 							return nil
 						}
-						slog.Warn("Retrying client creation", "client", name, "err", err, "retryIn", interval)
+						slog.Warn("Retrying client creation", "client", name, "err", redactURLCredentials(err), "retryIn", interval)
 						if !retryWait(ctx, interval) {
 							return nil
 						}
@@ -376,7 +382,7 @@ func startHTTPServer(config *Config) error {
 					return nil
 				}
 				if fatal := fatalStartupError(clientConfig, err); fatal != nil {
-					slog.Error("Failed to start client", "client", name, "err", err)
+					slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
 					return fatal
 				}
 				if mcpClient.closed.Load() {
@@ -384,20 +390,20 @@ func startHTTPServer(config *Config) error {
 					return nil
 				}
 				if !autoReconnect {
-					slog.Error("Failed to start client", "client", name, "err", err)
+					slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
 					return nil
 				}
 				if permanentStartupError(err) {
 					// Retrying cannot help - interactive OAuth is needed. Report
 					// it once, with the actionable message, and stop rather than
 					// hammering the provider every interval.
-					slog.Error("Not retrying, downstream cannot connect without intervention", "client", name, "err", err)
+					slog.Error("Not retrying, downstream cannot connect without intervention", "client", name, "err", redactURLCredentials(err))
 					return nil
 				}
 				// The backend is simply not up yet: wait and try again. The
 				// route is mounted only once it connects, so readiness keeps
 				// reporting it as not mounted until then.
-				slog.Warn("Retrying connection", "client", name, "err", err, "retryIn", interval)
+				slog.Warn("Retrying connection", "client", name, "err", redactURLCredentials(err), "retryIn", interval)
 				if !retryWait(ctx, interval) {
 					return nil
 				}
