@@ -4,7 +4,7 @@ go 1.25.5
 
 require (
 	github.com/go-sphere/confstore v0.0.4
-	github.com/mark3labs/mcp-go v1.0.0
+	github.com/mark3labs/mcp-go v1.1.0
 	github.com/tbxark/optional-go v0.0.2
 	golang.org/x/sync v0.22.0
 )

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -201,6 +202,7 @@ type rawDownstream struct {
 	// Optional descriptor/metadata controls. Zero values preserve the original
 	// empty-catalog behaviour.
 	toolExecution     map[string]any   // attached to every listed tool when set
+	toolsRaw          json.RawMessage  // verbatim tools array; overrides tools when set
 	resourceTemplates []map[string]any // raw templates; []any{} when nil
 	prompts           []string         // prompt names; none when nil
 	resources         []string         // resource URIs; none when nil
@@ -262,9 +264,16 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 			hang := d.hangToolsList
 			names := slices.Clone(d.tools)
 			execution := d.toolExecution
+			rawTools := slices.Clone(d.toolsRaw)
 			d.mu.Unlock()
 			if hang {
 				<-r.Context().Done()
+				return
+			}
+			// A test that cares about key order needs verbatim JSON: encoding a
+			// map would sort the property names and erase the thing under test.
+			if rawTools != nil {
+				writeResult(map[string]any{"tools": rawTools})
 				return
 			}
 			tools := make([]map[string]any, 0, len(names))
@@ -326,6 +335,14 @@ func (d *rawDownstream) setTools(names ...string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.tools = slices.Clone(names)
+}
+
+// setRawTools replaces the tools/list payload with raw JSON, so a test can
+// control key order (and anything else an encoded map would normalise).
+func (d *rawDownstream) setRawTools(raw string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.toolsRaw = json.RawMessage(raw)
 }
 
 func (d *rawDownstream) setPrompts(names ...string) {
@@ -407,6 +424,39 @@ func serverToolNames(t *testing.T, mcpServer *server.MCPServer) []string {
 	return names
 }
 
+// serverToolInputSchema reads back the raw inputSchema the proxy-side server
+// serves for a tool. It stays raw because a decoded map would lose the property
+// key order this is meant to inspect.
+func serverToolInputSchema(t *testing.T, mcpServer *server.MCPServer, toolName string) string {
+	t.Helper()
+
+	resp := mcpServer.HandleMessage(context.Background(), []byte(`{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+	}`))
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal tools/list response: %v", err)
+	}
+	var decoded struct {
+		Result struct {
+			Tools []struct {
+				Name        string          `json:"name"`
+				InputSchema json.RawMessage `json:"inputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal tools/list response: %v", err)
+	}
+	for _, tool := range decoded.Result.Tools {
+		if tool.Name == toolName {
+			return string(tool.InputSchema)
+		}
+	}
+	t.Fatalf("tool %q not registered on proxy server", toolName)
+	return ""
+}
+
 func newProxyServerForTest(t *testing.T) *server.MCPServer {
 	t.Helper()
 
@@ -457,6 +507,43 @@ func TestCatalogRegistrationDropsStaleToolsOnReRegister(t *testing.T) {
 	}
 	if got := serverToolNames(t, proxyServer); !slices.Equal(got, []string{"alpha"}) {
 		t.Errorf("tools after re-registration = %v, want [alpha]", got)
+	}
+}
+
+// The proxy re-serves the downstream's tool descriptors, so the inputSchema it
+// publishes must survive the decode/re-encode round trip. mcp-go v1.1.0 began
+// recording property key order on decode; before that the schema was rebuilt
+// from a map and the downstream's order was replaced with sorted order.
+func TestCatalogRegistrationPreservesInputSchemaPropertyOrder(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	// Deliberately not alphabetical: sorted order would be alpha, zeta.
+	downstream.setRawTools(`[{"name":"ordered","inputSchema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"number"}},"required":["zeta"]}}]`)
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options:       &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+
+	schema := serverToolInputSchema(t, proxyServer, "ordered")
+	zeta := strings.Index(schema, `"zeta"`)
+	alpha := strings.Index(schema, `"alpha"`)
+	if zeta == -1 || alpha == -1 {
+		t.Fatalf("inputSchema lost a property: %s", schema)
+	}
+	if zeta > alpha {
+		t.Errorf("inputSchema property order was normalised: %s", schema)
 	}
 }
 
