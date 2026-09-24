@@ -615,3 +615,53 @@ func TestNilOptionsClientDoesNotPanicOnConnect(t *testing.T) {
 	// process rather than this goroutine.
 	time.Sleep(100 * time.Millisecond)
 }
+
+func TestStripHopMetaDropsConnectionEnvelope(t *testing.T) {
+	t.Parallel()
+
+	in := &mcp.Meta{
+		ProgressToken: "p1",
+		AdditionalFields: map[string]any{
+			mcp.MetaKeyProtocolVersion:    mcp.ProtocolVersion20260728,
+			mcp.MetaKeyClientInfo:         map[string]any{"name": "caller"},
+			mcp.MetaKeyClientCapabilities: map[string]any{},
+			mcp.MetaKeyServerInfo:         map[string]any{"name": "proxy"},
+			mcp.MetaKeyLogLevel:           "debug",
+			mcp.MetaKeySubscriptionID:     "7",
+			"traceparent":                 "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+		},
+	}
+	out := stripHopMeta(in)
+
+	if out == nil || out.ProgressToken != "p1" {
+		t.Fatalf("progressToken lost: %#v", out)
+	}
+	for _, key := range hopMetaKeys {
+		if _, ok := out.AdditionalFields[key]; ok {
+			t.Errorf("%s forwarded: %#v", key, out.AdditionalFields)
+		}
+	}
+	if len(out.AdditionalFields) != 1 || out.AdditionalFields["traceparent"] == nil {
+		t.Errorf("unrelated fields not passed through: %#v", out.AdditionalFields)
+	}
+	// The inbound request's meta belongs to the caller; the proxy only edits a copy.
+	if len(in.AdditionalFields) != 7 {
+		t.Errorf("caller's meta was mutated: %#v", in.AdditionalFields)
+	}
+}
+
+func TestStripHopMetaEnvelopeOnly(t *testing.T) {
+	t.Parallel()
+
+	envelopeOnly := &mcp.Meta{AdditionalFields: map[string]any{mcp.MetaKeyProtocolVersion: mcp.ProtocolVersion20260728}}
+	if out := stripHopMeta(envelopeOnly); out != nil {
+		t.Errorf("envelope-only meta = %#v, want nil so no empty _meta is sent", out)
+	}
+	if out := stripHopMeta(nil); out != nil {
+		t.Errorf("nil meta = %#v, want nil", out)
+	}
+	progressOnly := &mcp.Meta{ProgressToken: "p1"}
+	if out := stripHopMeta(progressOnly); out != progressOnly {
+		t.Errorf("meta without additional fields = %#v, want it returned unchanged", out)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"os/exec"
@@ -455,8 +456,55 @@ func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mc
 	}
 	callCtx, cancel := c.withRequestTimeout(ctx)
 	defer cancel()
+	request.Params.Meta = stripHopMeta(request.Params.Meta)
 	result, err := cl.CallTool(callCtx, request)
 	return result, redactURLCredentials(err)
+}
+
+// hopMetaKeys are the _meta fields that protocol version 2026-07-28 uses to
+// carry per-connection state (SEP-2575). On a proxied request they describe the
+// caller's connection to this proxy, not the proxy's connection to the
+// downstream, so they must not be forwarded:
+//
+//   - On a legacy downstream connection mcp-go adds no envelope of its own, so
+//     a modern caller's protocolVersion reaches a server that negotiated an
+//     older version, next to an Mcp-Protocol-Version header naming that older
+//     version. Strict servers, mcp-go's own streamable HTTP server included,
+//     reject every such request as a header mismatch.
+//   - On a modern downstream connection mcp-go overwrites protocolVersion,
+//     clientCapabilities and clientInfo with its own, but a caller's logLevel,
+//     serverInfo or subscriptionId would still leak through.
+//
+// The matching inbound HTTP headers are already dropped: mcp-go does not reuse
+// the Header of a request that was decoded from the wire (outboundHeader).
+var hopMetaKeys = []string{
+	mcp.MetaKeyProtocolVersion,
+	mcp.MetaKeyClientInfo,
+	mcp.MetaKeyClientCapabilities,
+	mcp.MetaKeyServerInfo,
+	mcp.MetaKeyLogLevel,
+	mcp.MetaKeySubscriptionID,
+}
+
+// stripHopMeta returns meta without hopMetaKeys, leaving the caller's value
+// untouched. Everything else, such as progressToken or a traceparent, passes
+// through.
+func stripHopMeta(meta *mcp.Meta) *mcp.Meta {
+	if meta == nil || len(meta.AdditionalFields) == 0 {
+		return meta
+	}
+	stripped := *meta
+	stripped.AdditionalFields = maps.Clone(meta.AdditionalFields)
+	for _, k := range hopMetaKeys {
+		delete(stripped.AdditionalFields, k)
+	}
+	if len(stripped.AdditionalFields) == 0 {
+		stripped.AdditionalFields = nil
+	}
+	if stripped.ProgressToken == nil && stripped.AdditionalFields == nil {
+		return nil
+	}
+	return &stripped
 }
 
 // drainStderr keeps reading a stdio subprocess's stderr for as long as it runs.
@@ -749,6 +797,7 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 				}
 				callCtx, cancel := c.withRequestTimeout(ctx)
 				defer cancel()
+				request.Params.Meta = stripHopMeta(request.Params.Meta)
 				result, err := live.GetPrompt(callCtx, request)
 				return result, redactURLCredentials(err)
 			}})
@@ -852,6 +901,7 @@ func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceReque
 	}
 	callCtx, cancel := c.withRequestTimeout(ctx)
 	defer cancel()
+	request.Params.Meta = stripHopMeta(request.Params.Meta)
 	readResource, err := cl.ReadResource(callCtx, request)
 	if err != nil {
 		return nil, redactURLCredentials(err)
