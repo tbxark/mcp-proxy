@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"os/exec"
@@ -437,6 +438,20 @@ func redactURLCredentials(err error) error {
 	return &redactedError{msg: message, err: err}
 }
 
+func downstreamRequestMeta(meta *mcp.Meta) *mcp.Meta {
+	if meta == nil {
+		return nil
+	}
+	// Each proxy hop negotiates independently. The SDK supplies these fields for
+	// modern downstreams; legacy downstreams must use their initialize handshake.
+	result := *meta
+	result.AdditionalFields = maps.Clone(meta.AdditionalFields)
+	delete(result.AdditionalFields, mcp.MetaKeyProtocolVersion)
+	delete(result.AdditionalFields, mcp.MetaKeyClientInfo)
+	delete(result.AdditionalFields, mcp.MetaKeyClientCapabilities)
+	return &result
+}
+
 // callTool forwards a tool call to the downstream, bounded by requestTimeout
 // when one is configured.
 //
@@ -455,6 +470,7 @@ func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mc
 	}
 	callCtx, cancel := c.withRequestTimeout(ctx)
 	defer cancel()
+	request.Params.Meta = downstreamRequestMeta(request.Params.Meta)
 	result, err := cl.CallTool(callCtx, request)
 	return result, redactURLCredentials(err)
 }
@@ -749,6 +765,7 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 				}
 				callCtx, cancel := c.withRequestTimeout(ctx)
 				defer cancel()
+				request.Params.Meta = downstreamRequestMeta(request.Params.Meta)
 				result, err := live.GetPrompt(callCtx, request)
 				return result, redactURLCredentials(err)
 			}})
@@ -852,6 +869,7 @@ func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceReque
 	}
 	callCtx, cancel := c.withRequestTimeout(ctx)
 	defer cancel()
+	request.Params.Meta = downstreamRequestMeta(request.Params.Meta)
 	readResource, err := cl.ReadResource(callCtx, request)
 	if err != nil {
 		return nil, redactURLCredentials(err)
