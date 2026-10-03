@@ -222,6 +222,9 @@ func retryWait(ctx context.Context, interval time.Duration) bool {
 	}
 }
 
+// readHeaderTimeout is how long a client may take to send request headers.
+const readHeaderTimeout = 30 * time.Second
+
 func startHTTPServer(config *Config) error {
 	baseURL, uErr := url.Parse(config.McpProxy.BaseURL)
 	if uErr != nil {
@@ -238,6 +241,11 @@ func startHTTPServer(config *Config) error {
 	httpServer := &http.Server{
 		Addr:    config.McpProxy.Addr,
 		Handler: httpMux,
+		// Bounds only the request headers, so a client that opens connections
+		// and trickles headers (slowloris) cannot pin goroutines and sockets.
+		// Read/WriteTimeout stay unset: SSE and streamable-HTTP responses are
+		// long-lived streams.
+		ReadHeaderTimeout: readHeaderTimeout,
 	}
 	info := mcp.Implementation{
 		Name: config.McpProxy.Name,

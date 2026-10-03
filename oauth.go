@@ -55,7 +55,7 @@ func buildOAuthConfig(serverName string, conf *OAuthClientConfig) (transport.OAu
 		ClientSecret:          clientSecret,
 		RedirectURI:           redirectURI,
 		Scopes:                conf.Scopes,
-		TokenStore:            NewFileTokenStore(tokenPath),
+		TokenStore:            earlyRefreshTokenStore{NewFileTokenStore(tokenPath)},
 		PKCEEnabled:           !conf.PKCEDisabled,
 		AuthServerMetadataURL: conf.AuthServerMetadataURL,
 	}, nil

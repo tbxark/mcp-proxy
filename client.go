@@ -66,10 +66,23 @@ type Client struct {
 	hasConnected bool
 	closed       atomic.Bool
 
+	// life is cancelled by Close. Everything the client runs in the
+	// background (the keepalive/reconnect loop, the long-lived Start context of
+	// a transport) is bound to it as well as to the caller's context, because
+	// the caller's context can outlive the client: a server stopped by a
+	// reload is closed while the proxy - and the context its boot-time
+	// supervisor was given - keeps running. Without this the keepalive loop of
+	// a closed client probes a dead transport and retries "client is closed"
+	// forever.
+	life     context.Context
+	stopLife context.CancelFunc
+
 	// remembered from the last addToMCPServer so the ping task can reconnect.
 	clientInfo mcp.Implementation
 	mcpServer  *server.MCPServer
 	pingOnce   sync.Once
+	// pingDone is closed when the keepalive loop exits; nil if none started.
+	pingDone chan struct{}
 }
 
 func (c *Client) Health() clientHealth {
@@ -121,6 +134,7 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 		options:    conf.Options,
 		clientConf: clientInfo,
 	}
+	c.life, c.stopLife = context.WithCancel(context.Background())
 	switch v := clientInfo.(type) {
 	case *StdioMCPClientConfig:
 		// Stdio servers are pinged too: a crashed subprocess is the most
@@ -200,7 +214,7 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 	defer c.connectMu.Unlock()
 
 	if c.closed.Load() {
-		return errors.New("client is closed")
+		return errClientClosed
 	}
 
 	// Reuse the transport built at construction for the very first attempt;
@@ -271,7 +285,7 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 	// one here rather than leak it (a stdio transport owns a subprocess).
 	if c.closed.Load() {
 		_ = raw.Close()
-		return errors.New("client is closed")
+		return errClientClosed
 	}
 	slog.Info("Successfully initialized MCP client", "client", c.name)
 
@@ -326,17 +340,47 @@ func (c *Client) forget(raw *client.Client) {
 	c.mu.Unlock()
 }
 
+// errClientClosed is returned by connect once Close has run. It is terminal:
+// nothing retries a closed client.
+var errClientClosed = errors.New("client is closed")
+
+// withLifetime derives a context that ends when ctx ends or when the client is
+// closed, whichever comes first. The returned cancel releases it early.
+func (c *Client) withLifetime(ctx context.Context) (context.Context, context.CancelFunc) {
+	bound, cancel := context.WithCancel(ctx)
+	if c.life == nil {
+		// A Client literal built by a test, not by newMCPClient.
+		return bound, cancel
+	}
+	stop := context.AfterFunc(c.life, cancel)
+	return bound, func() {
+		stop()
+		cancel()
+	}
+}
+
 func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementation, mcpServer *server.MCPServer) error {
 	c.clientInfo = clientInfo
 	c.mcpServer = mcpServer
 
+	// Bind everything this connection starts to the client's own lifetime,
+	// not only to the caller's: the boot-time supervisor passes the proxy's
+	// context, which outlives a client that a reload stops. On success the
+	// bound context is deliberately kept - the SSE event stream and the
+	// keepalive loop run under it - and Close is what ends it.
+	ctx, release := c.withLifetime(ctx)
 	if err := c.connect(ctx, clientInfo, mcpServer); err != nil {
+		release()
 		return err
 	}
 
 	if c.needPing {
 		c.pingOnce.Do(func() {
-			go c.startPingTask(ctx)
+			c.pingDone = make(chan struct{})
+			go func() {
+				defer close(c.pingDone)
+				c.startPingTask(ctx)
+			}()
 		})
 	}
 	return nil
@@ -546,6 +590,16 @@ func isTransportFailure(err error) bool {
 	return errors.As(err, &transportErr)
 }
 
+// repeatedFailureLogEvery is how often a failure that keeps repeating past
+// pingFailureThreshold is logged at WARN; the others go to DEBUG.
+const repeatedFailureLogEvery = 20
+
+// shouldLogRepeatedFailure reports whether the failCount-th consecutive probe
+// failure deserves a WARN line.
+func shouldLogRepeatedFailure(failCount int) bool {
+	return failCount <= pingFailureThreshold || failCount%repeatedFailureLogEvery == 0
+}
+
 func (c *Client) startPingTask(ctx context.Context) {
 	ticker := time.NewTicker(c.options.pingInterval())
 	defer ticker.Stop()
@@ -586,7 +640,15 @@ func (c *Client) startPingTask(ctx context.Context) {
 			}
 
 			failCount++
-			slog.Warn("MCP health probe failed", "client", c.name, "err", redactURLCredentials(err), "failures", failCount)
+			// A downstream that stays down fails every tick for as long as it
+			// is down. Every failure up to the threshold is worth a WARN, but
+			// after that only every repeatedFailureLogEvery-th one is, so a
+			// long outage does not flood the log.
+			probeLog := slog.Debug
+			if shouldLogRepeatedFailure(failCount) {
+				probeLog = slog.Warn
+			}
+			probeLog("MCP health probe failed", "client", c.name, "err", redactURLCredentials(err), "failures", failCount)
 			if failCount < pingFailureThreshold {
 				continue
 			}
@@ -599,8 +661,17 @@ func (c *Client) startPingTask(ctx context.Context) {
 			// transport in, so requests that arrive during the rebuild keep
 			// using the old one until the new one is ready.
 			rErr := c.reconnect(ctx)
+			if errors.Is(rErr, errClientClosed) || c.closed.Load() || ctx.Err() != nil {
+				// Stopped while the probe ran: the client is gone for good,
+				// so there is nothing left to keep alive.
+				return
+			}
 			if rErr != nil {
-				slog.Warn("Failed to reconnect downstream", "client", c.name, "err", redactURLCredentials(rErr))
+				reconnectLog := slog.Debug
+				if shouldLogRepeatedFailure(failCount) {
+					reconnectLog = slog.Warn
+				}
+				reconnectLog("Failed to reconnect downstream", "client", c.name, "err", redactURLCredentials(rErr), "failures", failCount)
 				continue
 			}
 			slog.Info("Reconnected downstream", "client", c.name, "afterFailures", failCount)
@@ -861,6 +932,11 @@ func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceReque
 
 func (c *Client) Close() error {
 	c.closed.Store(true)
+	// End the keepalive loop and any long-lived transport context before
+	// closing the transport, so nothing races to probe or rebuild it.
+	if c.stopLife != nil {
+		c.stopLife()
+	}
 	cl := c.getClient()
 	if cl == nil {
 		return nil

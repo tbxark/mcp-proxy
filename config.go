@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -459,7 +461,7 @@ func validateConfig(config *Config) error {
 			// can surface in theirs, and it lands in access logs. Warn (never
 			// reject: some servers, like the amap example, only accept a token
 			// this way) so the operator knows to prefer headers when possible.
-			if u, err := url.Parse(serverConfig.URL); err == nil && u.RawQuery != "" {
+			if u, err := url.Parse(serverConfig.URL); err == nil && u.RawQuery != "" && firstQueryURLWarning(name, serverConfig.URL) {
 				slog.Warn("Downstream URL contains a query string; prefer credentials in headers when the server supports them, since a query credential can appear in transport errors and access logs",
 					"server", name, "field", field+".url")
 			}
@@ -619,4 +621,18 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 		return nil, err
 	}
 	return config, nil
+}
+
+// queryURLWarned remembers which downstream URLs the query-string warning was
+// already logged for. validateConfig runs on every config write and every
+// reload (twice per management API edit), so without this the same advice was
+// repeated for an unchanged entry on every edit of any other server. Keyed by
+// server name and URL, so a changed URL is warned about again.
+var queryURLWarned sync.Map
+
+func firstQueryURLWarning(name, rawURL string) bool {
+	// Hash the URL: it carries a credential, and the set outlives the entry.
+	key := sha256.Sum256([]byte(name + "\x00" + rawURL))
+	_, seen := queryURLWarned.LoadOrStore(key, struct{}{})
+	return !seen
 }
