@@ -250,10 +250,12 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 		Roots:        nil,
 		Sampling:     nil,
 	}
-	if _, err := raw.Initialize(initCtx, initRequest); err != nil {
+	initResult, err := raw.Initialize(initCtx, initRequest)
+	if err != nil {
 		c.forget(raw)
 		return oauthAwareError(c.name, err)
 	}
+	forwardInstructions(mcpServer, initResult)
 
 	c.mu.Lock()
 	old := c.client
@@ -324,6 +326,16 @@ func (c *Client) forget(raw *client.Client) {
 		c.client = nil
 	}
 	c.mu.Unlock()
+}
+
+// forwardInstructions passes the backend's initialize instructions through to the
+// proxy's own server. Without it the proxy answers initialize with no instructions,
+// so clients never see the guidance the backend server provides.
+func forwardInstructions(mcpServer *server.MCPServer, res *mcp.InitializeResult) {
+	if mcpServer == nil || res == nil || res.Instructions == "" {
+		return
+	}
+	server.WithInstructions(res.Instructions)(mcpServer)
 }
 
 func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementation, mcpServer *server.MCPServer) error {
