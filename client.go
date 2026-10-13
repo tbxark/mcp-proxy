@@ -70,6 +70,24 @@ type Client struct {
 	clientInfo mcp.Implementation
 	mcpServer  *server.MCPServer
 	pingOnce   sync.Once
+	// lifeCtx is the long-lived context given to addToMCPServer. A rebuild
+	// triggered from a forwarded request must not use that request's context:
+	// Start ties the new transport to the context it receives.
+	lifeCtx context.Context
+
+	// hadSession holds the transports (*client.Client) that the downstream gave
+	// a streamable-http session on initialize. It is keyed by transport, not
+	// kept for the live one only, because requests still in flight on a
+	// replaced transport must be recognized too. See sessionLost.
+	hadSession sync.Map
+	// recoverMu serializes rebuilds, so that callers failing together on the
+	// same dead transport rebuild it once.
+	recoverMu sync.Mutex
+
+	// retired holds replaced streamable-http transports until retireGrace has
+	// passed; see retire.
+	retiredMu sync.Mutex
+	retired   map[*client.Client]*time.Timer
 }
 
 func (c *Client) Health() clientHealth {
@@ -255,6 +273,9 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 		return oauthAwareError(c.name, err)
 	}
 
+	if streamableSessionID(raw) != "" {
+		c.hadSession.Store(raw, struct{}{})
+	}
 	c.mu.Lock()
 	old := c.client
 	c.client = raw
@@ -264,12 +285,13 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 	// one rather than re-initializing this one.
 	c.hasConnected = true
 	if old != nil && old != raw {
-		_ = old.Close()
+		c.retire(old)
 	}
 	// Close does not hold connectMu, so it may have run while this transport was
 	// being built - it would have closed the previous one, not this. Close this
 	// one here rather than leak it (a stdio transport owns a subprocess).
 	if c.closed.Load() {
+		c.hadSession.Delete(raw)
 		_ = raw.Close()
 		return errors.New("client is closed")
 	}
@@ -329,6 +351,7 @@ func (c *Client) forget(raw *client.Client) {
 func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementation, mcpServer *server.MCPServer) error {
 	c.clientInfo = clientInfo
 	c.mcpServer = mcpServer
+	c.lifeCtx = ctx
 
 	if err := c.connect(ctx, clientInfo, mcpServer); err != nil {
 		return err
@@ -346,6 +369,165 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 // first connect. It is only called from the ping task.
 func (c *Client) reconnect(ctx context.Context) error {
 	return c.connect(ctx, c.clientInfo, c.mcpServer)
+}
+
+// reconnectIfCurrent rebuilds the downstream only if raw is still the live
+// transport. Several forwarded requests (and the ping task) can fail at the
+// same time on the same dead transport; the first one rebuilds it and the rest
+// find a new live client and use that, instead of tearing down a connection
+// that was just made.
+func (c *Client) reconnectIfCurrent(ctx context.Context, raw *client.Client) error {
+	c.recoverMu.Lock()
+	defer c.recoverMu.Unlock()
+	if c.getClient() != raw {
+		return nil
+	}
+	return c.reconnect(ctx)
+}
+
+// streamableSessionID returns the session id the downstream gave raw on
+// initialize, or "" when raw is not streamable-http or the server is stateless.
+func streamableSessionID(raw *client.Client) string {
+	if raw == nil {
+		return ""
+	}
+	if t, ok := raw.GetTransport().(*transport.StreamableHTTP); ok {
+		return t.GetSessionId()
+	}
+	return ""
+}
+
+// sessionLost reports whether err, returned by a request sent on raw, means the
+// streamable-http downstream no longer knows raw's session - which is what
+// happens when it restarts (a redeploy, a crash and relaunch, a process
+// manager bringing it back). The new process answers the old session id with
+// 404; mcp-go turns that into ErrSessionTerminated and clears the id, and from
+// then on every request goes out without one. A stateful server rejects those
+// with a JSON-RPC error (the Python SDK: "Bad Request: Missing session ID"),
+// which is not a transport error. mcp-go never re-initializes on its own, so
+// the connection is dead for good, but the keepalive treated that second error
+// as "alive": the route stayed broken - and /_readyz stayed ok - until the
+// proxy was restarted.
+//
+// The first case is the typed ErrSessionTerminated. The second is detected by
+// state rather than by matching the server's wording, which differs between
+// SDKs: raw had a session after connect and has none now. raw need not be the
+// live transport any more - a request that was in flight when another caller
+// rebuilt the connection is recognized the same way.
+func (c *Client) sessionLost(raw *client.Client, err error) bool {
+	if err == nil || raw == nil {
+		return false
+	}
+	if errors.Is(err, transport.ErrSessionTerminated) {
+		return true
+	}
+	_, had := c.hadSession.Load(raw)
+	return had && streamableSessionID(raw) == ""
+}
+
+// retireGrace is how long a replaced streamable-http transport stays open.
+const retireGrace = 10 * time.Second
+
+// retire closes a transport that connect has just replaced. stdio and sse ones
+// close at once, as before. A streamable-http one is closed after retireGrace:
+// closing it at once cancels the requests still in flight on it, and a
+// "context canceled" from our own Close cannot be told apart from a request the
+// server may have run, so forward could not retry it. Those requests were sent
+// on the session the downstream had just dropped, so the server refuses them
+// within milliseconds; left to finish, they come back with that refusal, which
+// sessionLost recognizes and forward retries on the new transport. A streamable
+// HTTP transport owns no process, so keeping it open a few more seconds costs
+// nothing but a few idle sockets.
+func (c *Client) retire(old *client.Client) {
+	if _, ok := old.GetTransport().(*transport.StreamableHTTP); !ok {
+		_ = old.Close()
+		return
+	}
+	c.retiredMu.Lock()
+	defer c.retiredMu.Unlock()
+	if c.retired == nil {
+		c.retired = map[*client.Client]*time.Timer{}
+	}
+	c.retired[old] = time.AfterFunc(retireGrace, func() {
+		c.retiredMu.Lock()
+		_, pending := c.retired[old]
+		delete(c.retired, old)
+		c.retiredMu.Unlock()
+		if !pending {
+			return // Close got to it first.
+		}
+		c.hadSession.Delete(old)
+		_ = old.Close()
+	})
+}
+
+// closeRetired closes every transport still waiting out retireGrace, so
+// shutdown does not leave them open.
+func (c *Client) closeRetired() {
+	c.retiredMu.Lock()
+	pending := c.retired
+	c.retired = nil
+	c.retiredMu.Unlock()
+	for old, timer := range pending {
+		timer.Stop()
+		c.hadSession.Delete(old)
+		_ = old.Close()
+	}
+}
+
+// recoverSession rebuilds the downstream after a forwarded request found its
+// session lost, and returns the live client to retry the request on once, or
+// nil when the request must fail as it is. It only acts with autoReconnect: the
+// option is the opt-in contract for in-place recovery, and without it an
+// orchestrator restarting the proxy owns recovery (the probe still reports the
+// client unhealthy).
+//
+// Retrying is safe because a request refused for an unknown (404) or missing
+// (400) session is rejected by the server's transport before it reaches a
+// handler - the Python and TypeScript SDKs and mcp-go's own server all
+// validate the session first - so the tool did not run and cannot run twice.
+// A request that fails any other way is never retried.
+func (c *Client) recoverSession(raw *client.Client, err error) *client.Client {
+	if !c.options.autoReconnect() || !c.sessionLost(raw, err) {
+		return nil
+	}
+	ctx := c.lifeCtx
+	if ctx == nil {
+		return nil
+	}
+	slog.Warn("Downstream lost its session (restarted?), reconnecting", "client", c.name, "err", redactURLCredentials(err))
+	if rErr := c.reconnectIfCurrent(ctx, raw); rErr != nil {
+		slog.Warn("Failed to reconnect downstream", "client", c.name, "err", redactURLCredentials(rErr))
+		return nil
+	}
+	live := c.getClient()
+	if live == nil || live == raw {
+		return nil
+	}
+	return live
+}
+
+// forward sends one request to the live downstream, bounded by requestTimeout
+// when one is configured, and retries it once on a rebuilt connection if the
+// first attempt found the session lost (see recoverSession).
+func forward[T any](ctx context.Context, c *Client, do func(context.Context, *client.Client) (T, error)) (T, error) {
+	var zero T
+	cl := c.getClient()
+	if cl == nil {
+		return zero, errors.New("downstream is not connected")
+	}
+	callCtx, cancel := c.withRequestTimeout(ctx)
+	result, err := do(callCtx, cl)
+	cancel()
+	if err == nil {
+		return result, nil
+	}
+	if live := c.recoverSession(cl, err); live != nil {
+		retryCtx, retryCancel := c.withRequestTimeout(ctx)
+		defer retryCancel()
+		result, err = do(retryCtx, live)
+	}
+	return result, redactURLCredentials(err)
 }
 
 // withRequestTimeout bounds ctx by the configured per-request timeout when one
@@ -448,15 +630,13 @@ func redactURLCredentials(err error) error {
 // wedging call. sse and streamable-http already bound this inside their
 // transports, so requestTimeout is left zero for them and the caller's context
 // is forwarded unchanged.
+//
+// A call that finds the downstream's session lost is retried once on a rebuilt
+// connection when autoReconnect is on; see recoverSession for why that is safe.
 func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	cl := c.getClient()
-	if cl == nil {
-		return nil, errors.New("downstream is not connected")
-	}
-	callCtx, cancel := c.withRequestTimeout(ctx)
-	defer cancel()
-	result, err := cl.CallTool(callCtx, request)
-	return result, redactURLCredentials(err)
+	return forward(ctx, c, func(ctx context.Context, cl *client.Client) (*mcp.CallToolResult, error) {
+		return cl.CallTool(ctx, request)
+	})
 }
 
 // drainStderr keeps reading a stdio subprocess's stderr for as long as it runs.
@@ -516,8 +696,7 @@ var catalogTimeout = 60 * time.Second
 // response is proof the downstream answered and is therefore alive. ListTools
 // is the one call every mounted client already answered during startup, so it
 // works for both protocol eras.
-func (c *Client) probe(ctx context.Context) error {
-	cl := c.getClient()
+func (c *Client) probe(ctx context.Context, cl *client.Client) error {
 	if cl == nil {
 		return errors.New("downstream is not connected")
 	}
@@ -559,7 +738,8 @@ func (c *Client) startPingTask(ctx context.Context) {
 			return
 		case <-ticker.C:
 			pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
-			err := c.probe(pingCtx)
+			raw := c.getClient()
+			err := c.probe(pingCtx, raw)
 			cancel()
 			if ctx.Err() != nil {
 				return
@@ -569,6 +749,28 @@ func (c *Client) startPingTask(ctx context.Context) {
 					slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
 					failCount = 0
 				}
+				c.health.Store(int32(healthOK))
+				continue
+			}
+			if c.sessionLost(raw, err) {
+				// Definitive, unlike a missed probe: the downstream forgot the
+				// session (it restarted) and no later probe can bring it back.
+				// Skip the threshold: report unhealthy now and, with
+				// autoReconnect, rebuild now instead of after
+				// pingFailureThreshold probes - which the next probes would
+				// never reach, since a stateful server answers a request without
+				// a session with a JSON-RPC error, not a transport error.
+				slog.Warn("Downstream lost its session (restarted?)", "client", c.name, "err", redactURLCredentials(err))
+				c.health.Store(int32(healthFailed))
+				if !autoReconnect {
+					continue
+				}
+				if rErr := c.reconnectIfCurrent(ctx, raw); rErr != nil {
+					slog.Warn("Failed to reconnect downstream", "client", c.name, "err", redactURLCredentials(rErr))
+					continue
+				}
+				slog.Info("Reconnected downstream", "client", c.name, "reason", "session lost")
+				failCount = 0
 				c.health.Store(int32(healthOK))
 				continue
 			}
@@ -597,8 +799,9 @@ func (c *Client) startPingTask(ctx context.Context) {
 			}
 			// Rebuild the downstream from scratch. connect() swaps the live
 			// transport in, so requests that arrive during the rebuild keep
-			// using the old one until the new one is ready.
-			rErr := c.reconnect(ctx)
+			// using the old one until the new one is ready. reconnectIfCurrent
+			// skips the rebuild if a forwarded request already replaced raw.
+			rErr := c.reconnectIfCurrent(ctx, raw)
 			if rErr != nil {
 				slog.Warn("Failed to reconnect downstream", "client", c.name, "err", redactURLCredentials(rErr))
 				continue
@@ -743,14 +946,9 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 			// unanswered prompt wedges the whole route exactly as an unanswered
 			// tool call would.
 			prompts = append(prompts, server.ServerPrompt{Prompt: prompt, Handler: func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
-				live := c.getClient()
-				if live == nil {
-					return nil, errors.New("downstream is not connected")
-				}
-				callCtx, cancel := c.withRequestTimeout(ctx)
-				defer cancel()
-				result, err := live.GetPrompt(callCtx, request)
-				return result, redactURLCredentials(err)
+				return forward(ctx, c, func(ctx context.Context, live *client.Client) (*mcp.GetPromptResult, error) {
+					return live.GetPrompt(ctx, request)
+				})
 			}})
 		}
 		if listed.NextCursor == "" {
@@ -846,21 +1044,18 @@ func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *se
 // per-request bound: an unanswered resource read occupies the single stdio
 // channel and takes the whole downstream unhealthy for every caller.
 func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	cl := c.getClient()
-	if cl == nil {
-		return nil, errors.New("downstream is not connected")
-	}
-	callCtx, cancel := c.withRequestTimeout(ctx)
-	defer cancel()
-	readResource, err := cl.ReadResource(callCtx, request)
+	readResource, err := forward(ctx, c, func(ctx context.Context, cl *client.Client) (*mcp.ReadResourceResult, error) {
+		return cl.ReadResource(ctx, request)
+	})
 	if err != nil {
-		return nil, redactURLCredentials(err)
+		return nil, err
 	}
 	return readResource.Contents, nil
 }
 
 func (c *Client) Close() error {
 	c.closed.Store(true)
+	c.closeRetired()
 	cl := c.getClient()
 	if cl == nil {
 		return nil
