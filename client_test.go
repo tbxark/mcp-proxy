@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -201,12 +202,13 @@ type rawDownstream struct {
 
 	// Optional descriptor/metadata controls. Zero values preserve the original
 	// empty-catalog behaviour.
-	toolExecution     map[string]any   // attached to every listed tool when set
-	toolsRaw          json.RawMessage  // verbatim tools array; overrides tools when set
-	resourceTemplates []map[string]any // raw templates; []any{} when nil
-	prompts           []string         // prompt names; none when nil
-	resources         []string         // resource URIs; none when nil
-	hangMethods       map[string]bool  // methods that accept and never answer
+	toolExecution     map[string]any    // attached to every listed tool when set
+	toolsRaw          json.RawMessage   // verbatim tools array; overrides tools when set
+	resourceTemplates []map[string]any  // raw templates; []any{} when nil
+	prompts           []string          // prompt names; none when nil
+	resources         []string          // resource URIs; none when nil
+	resourceNames     map[string]string // resource URI -> name; the URI when unset
+	hangMethods       map[string]bool   // methods that accept and never answer
 
 	server *httptest.Server
 }
@@ -226,6 +228,9 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 		var req struct {
 			ID     json.RawMessage `json:"id"`
 			Method string          `json:"method"`
+			Params struct {
+				URI string `json:"uri"`
+			} `json:"params"`
 		}
 		if err := json.Unmarshal(body, &req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -300,12 +305,21 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 		case "resources/list":
 			d.mu.Lock()
 			uris := slices.Clone(d.resources)
+			names := maps.Clone(d.resourceNames)
 			d.mu.Unlock()
 			resources := make([]map[string]any, 0, len(uris))
 			for _, uri := range uris {
-				resources = append(resources, map[string]any{"uri": uri, "name": uri})
+				name := uri
+				if named, ok := names[uri]; ok {
+					name = named
+				}
+				resources = append(resources, map[string]any{"uri": uri, "name": name})
 			}
 			writeResult(map[string]any{"resources": resources})
+		case "resources/read":
+			// Echo the URI back, so a test can tell a forwarded read from one the
+			// proxy refused.
+			writeResult(map[string]any{"contents": []map[string]any{{"uri": req.Params.URI, "text": "read " + req.Params.URI}}})
 		case "resources/templates/list":
 			d.mu.Lock()
 			templates := d.resourceTemplates
@@ -355,6 +369,15 @@ func (d *rawDownstream) setResources(uris ...string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.resources = slices.Clone(uris)
+}
+
+func (d *rawDownstream) setResourceName(uri, name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.resourceNames == nil {
+		d.resourceNames = make(map[string]string)
+	}
+	d.resourceNames[uri] = name
 }
 
 func (d *rawDownstream) setToolExecution(execution map[string]any) {
