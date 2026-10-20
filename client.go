@@ -70,6 +70,9 @@ type Client struct {
 	clientInfo mcp.Implementation
 	mcpServer  *server.MCPServer
 	pingOnce   sync.Once
+
+	// redactor scrubs credentials from results; nil when redaction is off.
+	redactor *redactor
 }
 
 func (c *Client) Health() clientHealth {
@@ -120,6 +123,7 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 		name:       name,
 		options:    conf.Options,
 		clientConf: clientInfo,
+		redactor:   newRedactor(name, conf.Options),
 	}
 	switch v := clientInfo.(type) {
 	case *StdioMCPClientConfig:
@@ -456,7 +460,10 @@ func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mc
 	callCtx, cancel := c.withRequestTimeout(ctx)
 	defer cancel()
 	result, err := cl.CallTool(callCtx, request)
-	return result, redactURLCredentials(err)
+	if err != nil {
+		return nil, c.redactor.toolError(ctx, request, redactURLCredentials(err))
+	}
+	return c.redactor.toolResult(ctx, request, result), nil
 }
 
 // drainStderr keeps reading a stdio subprocess's stderr for as long as it runs.
@@ -750,7 +757,10 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 				callCtx, cancel := c.withRequestTimeout(ctx)
 				defer cancel()
 				result, err := live.GetPrompt(callCtx, request)
-				return result, redactURLCredentials(err)
+				if err != nil {
+					return nil, c.redactor.promptError(ctx, request, redactURLCredentials(err))
+				}
+				return c.redactor.promptResult(ctx, request, result), nil
 			}})
 		}
 		if listed.NextCursor == "" {
@@ -854,9 +864,9 @@ func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceReque
 	defer cancel()
 	readResource, err := cl.ReadResource(callCtx, request)
 	if err != nil {
-		return nil, redactURLCredentials(err)
+		return nil, c.redactor.resourceError(ctx, request, redactURLCredentials(err))
 	}
-	return readResource.Contents, nil
+	return c.redactor.resourceContents(ctx, request, readResource.Contents), nil
 }
 
 func (c *Client) Close() error {

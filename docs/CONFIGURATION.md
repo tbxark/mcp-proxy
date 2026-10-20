@@ -190,6 +190,8 @@ fallback, so an existing registration keeps working.)
     exposes **no** tools. `mode: "block"` hides the listed tools, so an empty list
     hides nothing. The filter applies to tools only — a downstream's resources and
     prompts are always exposed.
+- `redact` (object, default off): Scan what this server returns for credentials and
+  replace each one before it reaches the client. See [redact](#redact) below.
 - `Disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
 - `autoReconnect` (bool, default `false`): Keep a downstream connection alive across
   failures. When true, a server that is unreachable at startup is retried every
@@ -209,6 +211,9 @@ fallback, so an existing registration keeps working.)
 
 Notes:
 
+- `mcpProxy.options.redact` is inherited by every server that has no `redact` block of
+  its own. A server's block replaces the inherited one as a whole (no field merging), so
+  `"redact": {"enabled": false}` turns it off for one server.
 - `mcpProxy.options.authTokens` serves as the default token set if a server omits `options.authTokens`.
 - `mcpProxy.options.toolFilter` likewise serves as the default filter if a server omits
   `options.toolFilter`. The other `mcpProxy.options` values (`panicIfInvalid`, `logEnabled`,
@@ -216,3 +221,108 @@ Notes:
   them, so a fleet-wide setting can be declared once. `disabled` is per-server only and is
   not inherited.
 - To discover tool names for filtering, start without a filter and check logs for lines like `<server> Adding tool <name>`.
+
+## redact
+
+Tool results, resource contents and prompt messages can carry credentials that a
+downstream read from somewhere else: a chat message with a password, a pasted `.env`
+file, a log line with a token. With `redact` enabled, the proxy scans that text and
+replaces every finding with `[REDACTED:<kind>]` before the response leaves the proxy.
+
+```jsonc
+"options": {
+  "redact": {
+    "enabled": true,
+    "highEntropy": false,        // optional, see below
+    "disableRules": ["jwt"]      // optional, finding kinds to keep visible
+  }
+}
+```
+
+`disableRules` works on the kind a finding is reported as: `["password"]` leaves every
+`password` finding visible, whichever rule found it.
+
+What is scanned:
+
+- `text` content of a tool result, the text of embedded resources, resource links
+  (`uri`, `title`, `description`), nested `tool_result` content, `tool_use` input, and
+  `structuredContent` (every string value, and numbers under a secret member name);
+- `resources/read` contents with `text`;
+- blobs (embedded or read) whose `mimeType` is textual (`text/*`, JSON, XML, YAML and
+  similar), up to 8 MiB decoded; they are decoded, scanned and re-encoded;
+- the description and text content of `prompts/get` results;
+- the message of an error the downstream returns for any of these calls.
+
+Images, audio and other binary blobs pass through untouched, and so does `_meta`.
+
+When a text value is itself a JSON document (most MCP servers return JSON as text), the
+proxy rewrites it string by string: escapes such as `\n` or `\u0070` are decoded before
+matching, member names give context (`"password": "..."`), and everything else in the
+document, including key order and spacing, is left byte-for-byte as it was. A number
+stored under a secret member (`"pin": 123456`) becomes the marker string, which can
+make the result fail a strict `outputSchema` check in a client that validates it.
+Everything inside an object, array or embedded JSON string stored under a secret member
+counts as secret (`{"token": {"access": "...", "refresh": "..."}}`), except members that
+describe it such as `type`, `scope`, `expires_in` or `username`. JSON nested
+inside JSON strings is followed five levels deep; deeper levels are scanned as plain
+text.
+
+Rule kinds:
+
+| Kind | Matches |
+|---|---|
+| `private_key` | PEM private key blocks (RSA, EC, OpenSSH, PGP, PKCS#8), including a block cut off before its END line |
+| `aws_access_key`, `aws_secret_key` | `AKIA…`/`ASIA…` key ids; a 40-character secret after `aws_secret_access_key` |
+| `github_token`, `gitlab_token` | `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`, `github_pat_`; `glpat-` and the other GitLab prefixes |
+| `anthropic_api_key`, `openai_api_key` | `sk-ant-…`; `sk-proj-…`, `sk-svcacct-…`, `sk-admin-…`, legacy `sk-…` |
+| `google_api_key`, `google_oauth_token` | `AIza…`; `ya29.…` access tokens, `GOCSPX-…` client secrets, `1//0…` refresh tokens |
+| `slack_token`, `slack_webhook` | `xoxb-`/`xoxp-`/… and `xapp-` tokens; `hooks.slack.com` webhook URLs |
+| `telegram_bot_token` | `<bot id>:<35 characters>` |
+| `stripe_key` | `sk_live_`, `sk_test_`, `rk_live_`, `rk_test_` |
+| `jwt` | three base64url segments starting with `eyJ` |
+| `auth_header` | the credential in `Authorization: Bearer/Basic/Token/Digest …` |
+| `url_password` | the password in `scheme://user:password@host` (the user name stays) |
+| `env_secret`, `password` | `NAME=value` lines whose name contains a secret word (`PASSWORD`, `SECRET`, `TOKEN`, `KEY`, `AUTH`, `DSN`, …); password-like names report `password` |
+| `password`, `secret` | `password: …`, `pwd=…`, `api_key = …`, `token: …` and similar pairs in prose, YAML, INI and query strings, and JSON members such as `"client_secret": "…"` |
+| `high_entropy` | only with `highEntropy: true`: tokens of 24+ characters mixing upper case, lower case and digits with high Shannon entropy |
+
+Trade-offs, chosen to keep ordinary output readable:
+
+- Values that are obviously not secrets are kept: shorter than 3 characters, variable
+  references (`${DB_PASSWORD}`, `$TOKEN`; `$ecretP4ss` still counts as a password),
+  templates (`{{ token }}`, `<your-token>`), masks (`****`) and words such as `none`,
+  `null`, `expired`.
+- Names that describe a secret rather than hold it are skipped: `TOKEN_URL`,
+  `PASSWORD_MIN_LENGTH`, `API_KEY_ID`, `PUBLIC_KEY`, `PWD=/path`. A bare `token` member
+  counts, but pagination names such as `nextPageToken` or `page_token` do not, and
+  neither do flags such as `isSecret` or `has_password`, or data keys such as `SORT_KEY`.
+- Known false positives: a member whose last word is `pass` (`boardingPass`), and on a
+  `NAME=value` line the whole rest of the line, so `client_secret=abc&x=1` hides `&x=1`
+  too.
+- Hex digests, UUIDs, numbers and dates on their own are not matched by the specific
+  rules (after a label such as `token:` they are).
+  `highEntropy` also skips them (they lack mixed case), and skips tokens inside paths and
+  URLs (`spaces/AAAA/messages/BBBB`) and SSH public keys, but it does match other opaque
+  ids such as Telegram file ids. A tool that takes such an id back as an argument (a
+  media download) then stops working, which is why it is off by default.
+
+Limits: redaction finds secrets by their shape. It does not catch a password written as
+plain prose ("the code is the name of my cat"), a secret that is base64-encoded,
+reversed or split across several messages, a token format it does not know (unless
+`highEntropy` happens to catch it), or a name and a value stored in separate members
+(`{"name": "DB_PASSWORD", "value": "..."}`). Treat it as a guard against accidental exposure, not
+as a boundary against a downstream that tries to leak data.
+
+Each response with findings is logged at info level with the server, method, tool or
+resource name, count and kinds. Values are never logged.
+
+### Custom replacement
+
+The replacement text comes from a `RedactionHook`
+(`Replace(ctx, RedactionSource, RedactionFinding) string`). The default returns
+`[REDACTED:<kind>]`. A custom build can install its own hook with `SetRedactionHook`
+from an `init` function in an extra file, for example to keep the value in a vault and
+return a reference to it, without changing `redact.go`. The hook receives the server
+name, MCP method, tool name or resource URI, the request arguments and the matched value.
+The value is the secret as written, decoded when it sat inside a JSON string. The hook
+runs on request goroutines, concurrently, so it must be safe for concurrent use.

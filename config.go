@@ -9,6 +9,7 @@ import (
 	nethttp "net/http"
 	"net/url"
 	"path"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -189,12 +190,28 @@ type ToolFilterConfig struct {
 	List []string       `json:"list,omitempty"`
 }
 
+// RedactConfig turns on secret redaction for a downstream's results. See
+// redact.go and docs/CONFIGURATION.md.
+type RedactConfig struct {
+	// Enabled must be true for anything to be redacted.
+	Enabled bool `json:"enabled"`
+	// HighEntropy also redacts long random-looking tokens that match no
+	// specific format. It catches unknown token formats at the cost of false
+	// positives on opaque ids, so it is off by default.
+	HighEntropy bool `json:"highEntropy,omitempty"`
+	// DisableRules lists rule kinds to skip, e.g. ["jwt"].
+	DisableRules []string `json:"disableRules,omitempty"`
+}
+
 type OptionsV2 struct {
 	PanicIfInvalid optional.Field[bool] `json:"panicIfInvalid"`
 	LogEnabled     optional.Field[bool] `json:"logEnabled"`
 	AuthTokens     []string             `json:"authTokens,omitempty"`
 	ToolFilter     *ToolFilterConfig    `json:"toolFilter,omitempty"`
-	Disabled       bool                 `json:"disabled,omitempty"`
+	// Redact scans downstream results for credentials and replaces them. A
+	// server without its own redact block inherits mcpProxy.options.redact.
+	Redact   *RedactConfig `json:"redact,omitempty"`
+	Disabled bool          `json:"disabled,omitempty"`
 	// PingInterval is how often this connection is probed to keep it alive and
 	// to notice that it died; it sets how quickly /_readyz reports degraded.
 	PingInterval Duration `json:"pingInterval,omitempty"`
@@ -359,6 +376,9 @@ func validateOptions(field string, options *OptionsV2) error {
 			return fmt.Errorf("%s.authTokens[%d] cannot be empty", field, i)
 		}
 	}
+	if err := validateRedact(field+".redact", options.Redact); err != nil {
+		return err
+	}
 	if options.ToolFilter == nil {
 		return nil
 	}
@@ -369,6 +389,22 @@ func validateOptions(field string, options *OptionsV2) error {
 	for i, toolName := range options.ToolFilter.List {
 		if strings.TrimSpace(toolName) == "" {
 			return fmt.Errorf("%s.toolFilter.list[%d] cannot be empty", field, i)
+		}
+	}
+	return nil
+}
+
+func validateRedact(field string, redact *RedactConfig) error {
+	if redact == nil {
+		return nil
+	}
+	if !redact.Enabled && (redact.HighEntropy || len(redact.DisableRules) > 0) {
+		slog.Warn(field+" has settings but enabled is false, so nothing is redacted for it", "field", field)
+	}
+	known := redactionRuleKinds()
+	for i, kind := range redact.DisableRules {
+		if !slices.Contains(known, kind) {
+			return fmt.Errorf("%s.disableRules[%d]: unknown rule %q (known: %s)", field, i, kind, strings.Join(known, ", "))
 		}
 	}
 	return nil
@@ -604,6 +640,9 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 		}
 		if clientConfig.Options.ReconnectInterval == 0 {
 			clientConfig.Options.ReconnectInterval = conf.McpProxy.Options.ReconnectInterval
+		}
+		if clientConfig.Options.Redact == nil {
+			clientConfig.Options.Redact = conf.McpProxy.Options.Redact
 		}
 	}
 

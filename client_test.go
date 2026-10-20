@@ -201,12 +201,13 @@ type rawDownstream struct {
 
 	// Optional descriptor/metadata controls. Zero values preserve the original
 	// empty-catalog behaviour.
-	toolExecution     map[string]any   // attached to every listed tool when set
-	toolsRaw          json.RawMessage  // verbatim tools array; overrides tools when set
-	resourceTemplates []map[string]any // raw templates; []any{} when nil
-	prompts           []string         // prompt names; none when nil
-	resources         []string         // resource URIs; none when nil
-	hangMethods       map[string]bool  // methods that accept and never answer
+	toolExecution     map[string]any             // attached to every listed tool when set
+	toolsRaw          json.RawMessage            // verbatim tools array; overrides tools when set
+	resourceTemplates []map[string]any           // raw templates; []any{} when nil
+	prompts           []string                   // prompt names; none when nil
+	resources         []string                   // resource URIs; none when nil
+	hangMethods       map[string]bool            // methods that accept and never answer
+	methodResults     map[string]json.RawMessage // verbatim result per method, e.g. tools/call
 
 	server *httptest.Server
 }
@@ -249,6 +250,14 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 				"id":      req.ID,
 				"result":  result,
 			})
+		}
+
+		d.mu.Lock()
+		canned, hasCanned := d.methodResults[req.Method]
+		d.mu.Unlock()
+		if hasCanned {
+			writeResult(canned)
+			return
 		}
 
 		switch req.Method {
@@ -367,6 +376,16 @@ func (d *rawDownstream) setResourceTemplates(templates ...map[string]any) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.resourceTemplates = slices.Clone(templates)
+}
+
+// setMethodResult makes the downstream answer method with a verbatim result.
+func (d *rawDownstream) setMethodResult(method, result string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.methodResults == nil {
+		d.methodResults = make(map[string]json.RawMessage)
+	}
+	d.methodResults[method] = json.RawMessage(result)
 }
 
 func (d *rawDownstream) hangMethodsNamed(methods ...string) {
