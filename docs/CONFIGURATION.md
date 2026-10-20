@@ -20,6 +20,9 @@ and the proxy's `globalAuthTokens` become `mcpProxy.options.authTokens`.
 
 - Online converter (build Claude config from your proxy): https://tbxark.github.io/mcp-proxy
 
+- [Dreamtune example](../examples/dreamtune.md): proxy a hosted streamable HTTP
+  server with separate upstream and client credentials supplied from the environment.
+
 ## Full Example
 
 ```jsonc
