@@ -1,0 +1,24 @@
+{
+  "mcpProxy": {
+    "baseURL": "http://127.0.0.1:9090",
+    "addr": "127.0.0.1:9090",
+    "name": "Dreamtune MCP Proxy",
+    "version": "1.0.0",
+    "type": "streamable-http",
+    "options": {
+      "authTokens": ["${MCP_PROXY_TOKEN}"],
+      "logEnabled": false,
+      "panicIfInvalid": true
+    }
+  },
+  "mcpServers": {
+    "dreamtune": {
+      "url": "https://mcp.dreamtunelabs.com/mcp",
+      "transportType": "streamable-http",
+      "headers": {
+        "X-Dreamtune-API-Key": "${DREAMTUNE_API_KEY}"
+      },
+      "timeout": "120s"
+    }
+  }
+}
