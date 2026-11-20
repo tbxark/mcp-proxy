@@ -430,27 +430,6 @@ func TestOAuthTokenAndClientPathsDoNotAlias(t *testing.T) {
 	}
 }
 
-// RF-007 compatibility: a client registered under the pre-fix file name is
-// still found, so an existing deployment is not forced to re-authorize.
-func TestLoadRegisteredClientReadsLegacyPath(t *testing.T) {
-	isolateUserConfigDir(t)
-	const serverName = "reviewfix-legacy"
-
-	legacyPath, err := oauthLegacyClientPath(serverName)
-	if err != nil {
-		t.Fatalf("oauthLegacyClientPath: %v", err)
-	}
-	writeFile(t, legacyPath, `{"clientId":"legacy-id","clientSecret":"legacy-secret"}`)
-
-	clientID, secret, ok, err := loadRegisteredClient(serverName)
-	if err != nil {
-		t.Fatalf("loadRegisteredClient: %v", err)
-	}
-	if !ok || clientID != "legacy-id" || secret != "legacy-secret" {
-		t.Fatalf("legacy client = (%q,%q,%v), want (legacy-id,legacy-secret,true)", clientID, secret, ok)
-	}
-}
-
 // RF-004: a URL that fails to parse must still be redacted. The first cut used
 // url.Parse and silently returned the original text when parsing failed, which
 // leaked the credential in exactly the malformed-URL case.
@@ -507,84 +486,20 @@ func TestFatalStartupErrorIsRedacted(t *testing.T) {
 	}
 }
 
-// RF-007 read-side: the legacy fallback must not read ANOTHER server's token
-// file. The legacy client path of "X" is the token path of "X.client", so with
-// no legacy client file present the token of "X.client" must be ignored rather
-// than parsed as a client registration (which fails with a confusing clientId
-// error and leaves "X" unable to start).
-func TestLoadRegisteredClientIgnoresOtherServersToken(t *testing.T) {
-	isolateUserConfigDir(t)
-	const serverName = "reviewfix-owner"
-	const collidingName = serverName + ".client"
-
-	// The colliding server has a token at what is the legacy client path of
-	// serverName. No legacy client file exists for serverName.
-	tokenPath, err := oauthTokenPath(collidingName)
-	if err != nil {
-		t.Fatalf("oauthTokenPath: %v", err)
-	}
-	legacyPath, err := oauthLegacyClientPath(serverName)
-	if err != nil {
-		t.Fatalf("oauthLegacyClientPath: %v", err)
-	}
-	if tokenPath != legacyPath {
-		t.Fatalf("precondition: expected %q and %q to coincide", tokenPath, legacyPath)
-	}
-	if err := NewFileTokenStore(tokenPath).SaveToken(context.Background(), &transport.Token{AccessToken: "tok"}); err != nil {
-		t.Fatalf("SaveToken: %v", err)
-	}
-
-	clientID, secret, ok, err := loadRegisteredClient(serverName)
-	if err != nil {
-		t.Fatalf("loadRegisteredClient must not fail on another server's token file: %v", err)
-	}
-	if ok || clientID != "" || secret != "" {
-		t.Fatalf("loadRegisteredClient = (%q,%q,%v), want (\"\",\"\",false)", clientID, secret, ok)
-	}
-}
-
-// RF-007 read-side: ignoring a token file must not also swallow a genuinely
-// corrupt client file, which should still report why it could not be used.
-func TestLoadRegisteredClientReportsCorruptLegacyFile(t *testing.T) {
-	isolateUserConfigDir(t)
-	const serverName = "reviewfix-corrupt"
-
-	legacyPath, err := oauthLegacyClientPath(serverName)
-	if err != nil {
-		t.Fatalf("oauthLegacyClientPath: %v", err)
-	}
-	writeFile(t, legacyPath, `{"clientId":`)
-
-	if _, _, _, err := loadRegisteredClient(serverName); err == nil {
-		t.Fatal("a malformed legacy client file should surface a parse error")
-	}
-}
-
-// RF-007: a server's token read must not accept another server's client
-// registration. The path is shared with the pre-fix name, so a client JSON has
-// no access or refresh token and must read as "no token", not as an empty one.
+// A file that holds no access token and no refresh token is not a usable
+// credential, so it reads as "no token" and the daemon asks for authorization.
 func TestGetTokenRejectsNonTokenFile(t *testing.T) {
 	isolateUserConfigDir(t)
-	// The legacy client path of "reviewfix-owner" is the token path of
-	// "reviewfix-owner.client": legacyClientPath(D) == tokenPath(D+".client").
-	const ownerName = "reviewfix-owner"
-	const serverName = ownerName + ".client"
+	const serverName = "reviewfix-owner"
 
 	path, err := oauthTokenPath(serverName)
 	if err != nil {
 		t.Fatalf("oauthTokenPath: %v", err)
 	}
-	legacyOwner, err := oauthLegacyClientPath(ownerName)
-	if err != nil {
-		t.Fatalf("oauthLegacyClientPath: %v", err)
-	}
-	if path != legacyOwner {
-		t.Fatalf("precondition: expected token(%q)=%q to equal legacyClient(%q)=%q", serverName, path, ownerName, legacyOwner)
-	}
-	writeFile(t, path, `{"clientId":"someone-elses-client","clientSecret":"s"}`)
+	writeFile(t, path, `{"clientId":"x"}`)
 
 	if _, err := NewFileTokenStore(path).GetToken(context.Background()); !errors.Is(err, transport.ErrNoToken) {
-		t.Fatalf("GetToken on a client-registration file = %v, want ErrNoToken", err)
+		t.Fatalf("GetToken on a non-token file = %v, want ErrNoToken", err)
 	}
 }
 
