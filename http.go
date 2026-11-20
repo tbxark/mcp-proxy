@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -75,6 +76,61 @@ func newAuthMiddleware(tokens []string) MiddlewareFunc {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// hostGuardMiddleware is the DNS-rebinding protection for the MCP routes,
+// replacing the loopback-only guard mcp-go ships (disabled in newMCPServer)
+// with one that also accepts the public host the proxy serves under.
+//
+// The guard only applies when the connection arrived on a loopback interface -
+// a request that came in over a public interface already proves the client
+// reached the right address. On loopback the Host header's hostname must be a
+// loopback name itself (localhost, 127.0.0.0/8, ::1) or match allowedHost, the
+// hostname of mcpProxy.baseURL, so a same-host reverse proxy can forward its
+// public Host to a loopback listener.
+func hostGuardMiddleware(allowedHost string) MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			localAddr, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+			if localAddr == nil || !isLoopbackAddr(localAddr) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			host := r.Host
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+			host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+			if isLoopbackHostname(host) || strings.EqualFold(host, allowedHost) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			http.Error(w, "Forbidden: invalid Host header", http.StatusForbidden)
+		})
+	}
+}
+
+// isLoopbackAddr reports whether addr names a loopback interface.
+func isLoopbackAddr(addr net.Addr) bool {
+	if tcp, ok := addr.(*net.TCPAddr); ok {
+		return tcp.IP.IsLoopback()
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// isLoopbackHostname reports whether host is a loopback name: "localhost", an
+// address in 127.0.0.0/8, or ::1.
+func isLoopbackHostname(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func loggerMiddleware(prefix string) MiddlewareFunc {
@@ -226,6 +282,10 @@ func startHTTPServer(config *Config) error {
 		// redact anyway since the parse error embeds the URL.
 		return redactURLCredentials(uErr)
 	}
+	// The host DNS-rebinding protection accepts, besides loopback Host values:
+	// the public hostname the proxy is published under, so a reverse proxy can
+	// forward it to a loopback listener.
+	allowedHost := baseURL.Hostname()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -296,6 +356,7 @@ func startHTTPServer(config *Config) error {
 				// and the logger records requests that auth rejects.
 				middlewares := make([]MiddlewareFunc, 0)
 				middlewares = append(middlewares, recoverMiddleware(name))
+				middlewares = append(middlewares, hostGuardMiddleware(allowedHost))
 				if clientConfig.Options.logEnabled() {
 					middlewares = append(middlewares, loggerMiddleware(name))
 				}

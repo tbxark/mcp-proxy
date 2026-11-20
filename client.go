@@ -1192,17 +1192,24 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 
 	var handler http.Handler
 
+	// mcp-go's own DNS-rebinding guard is disabled on both handlers: it only
+	// accepts loopback Host values, which breaks the common case of a reverse
+	// proxy on the same host forwarding its public Host to a loopback listener.
+	// hostGuardMiddleware in http.go enforces the same protection but also
+	// allows the mcpProxy.baseURL host.
 	switch serverConfig.Type {
 	case MCPServerTypeSSE:
 		handler = server.NewSSEServer(
 			mcpServer,
 			server.WithStaticBasePath(name),
 			server.WithBaseURL(serverConfig.BaseURL),
+			server.WithSSEDisableLocalhostProtection(true),
 		)
 	case MCPServerTypeStreamable:
 		handler = server.NewStreamableHTTPServer(
 			mcpServer,
 			server.WithStateLess(true),
+			server.WithDisableLocalhostProtection(true),
 		)
 	default:
 		return nil, fmt.Errorf("unknown server type: %s", serverConfig.Type)

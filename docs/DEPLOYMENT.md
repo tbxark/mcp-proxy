@@ -61,6 +61,10 @@ services:
     command: ["--config", "http://caddy/config.json"]
 ```
 
+## Reverse proxy
+
+When mcp-proxy listens on loopback behind nginx/Caddy, forward the public Host that matches the hostname of `mcpProxy.baseURL` (or use `localhost`): on loopback connections any other Host value is rejected with `403 Forbidden` as DNS-rebinding protection.
+
 ## Security Notes
 
 - Prefer `authTokens` per downstream server; only use the `mcpProxy` default when appropriate.
