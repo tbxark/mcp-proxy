@@ -965,6 +965,12 @@ func (c *Client) startPingTask(ctx context.Context) {
 }
 
 // toolFilterFunc builds the tool exposure predicate for one client.
+//
+// With no filter every tool is exposed. mode=allow exposes exactly the listed
+// tools (validation requires a non-empty list) and mode=block hides the listed
+// ones. An unrecognized mode cannot come from a validated config - it means
+// the OptionsV2 was built programmatically - so it fails closed, exposing
+// nothing, with a warning.
 func toolFilterFunc(name string, options *OptionsV2) func(string) bool {
 	if options == nil {
 		return func(string) bool { return true }
