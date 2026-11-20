@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // isolateUserConfigDir points the user config dir at a temp dir for one test.
 //
@@ -18,4 +22,14 @@ func isolateUserConfigDir(t *testing.T) string {
 	// Windows uses %AppData%; HOME is not consulted there.
 	t.Setenv("AppData", dir)
 	return dir
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
 }

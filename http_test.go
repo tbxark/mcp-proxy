@@ -5,10 +5,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/tbxark/optional-go"
 )
 
 // The recover middleware is listed first so it wraps the others: a panic in
@@ -202,5 +204,32 @@ func TestPermanentStartupErrorClassification(t *testing.T) {
 				t.Errorf("permanentStartupError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+// The fatal startup path returns the transport error out of the startup
+// errorGroup, where main logs it. It must be redacted there too.
+func TestFatalStartupErrorIsRedacted(t *testing.T) {
+	t.Parallel()
+
+	urlErr := &url.Error{Op: "Post", URL: "https://mcp.example.com/mcp?key=FATAL_SECRET", Err: errors.New("refused")}
+
+	panicIfInvalid := optional.NewField(true)
+
+	fatal := startupFailed("test", &MCPClientConfigV2{Options: &OptionsV2{PanicIfInvalid: panicIfInvalid}}, urlErr)
+	if fatal == nil {
+		t.Fatal("panicIfInvalid should make the failure fatal")
+	}
+	if strings.Contains(fatal.Error(), "FATAL_SECRET") {
+		t.Fatalf("the fatal startup error still carries the credential: %s", fatal)
+	}
+	var asURLErr *url.Error
+	if !errors.As(fatal, &asURLErr) {
+		t.Error("redaction must preserve the url.Error in the chain")
+	}
+
+	// Without panicIfInvalid the failure is not fatal at all.
+	if got := startupFailed("test", &MCPClientConfigV2{Options: &OptionsV2{}}, urlErr); got != nil {
+		t.Errorf("a non-fatal startup error should return nil, got %v", got)
 	}
 }

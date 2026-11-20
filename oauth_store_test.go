@@ -164,3 +164,70 @@ func TestEarlyRefreshTokenStore(t *testing.T) {
 		t.Errorf("empty store err = %v, want ErrNoToken", err)
 	}
 }
+
+func TestOAuthTokenAndClientPathsDoNotAlias(t *testing.T) {
+	isolateUserConfigDir(t)
+	const serverName = "notion"
+	const collidingName = serverName + ".client"
+
+	tokenPath, err := oauthTokenPath(collidingName)
+	if err != nil {
+		t.Fatalf("oauthTokenPath: %v", err)
+	}
+	clientPath, err := oauthClientPath(serverName)
+	if err != nil {
+		t.Fatalf("oauthClientPath: %v", err)
+	}
+	if tokenPath == clientPath {
+		t.Fatalf("token path of %q aliases the client path of %q: %s", collidingName, serverName, tokenPath)
+	}
+
+	// Distinct servers never share a file, in either direction.
+	for _, name := range []string{serverName, collidingName, "a.b", "server-abc"} {
+		path, err := oauthTokenPath(name)
+		if err != nil {
+			t.Fatalf("oauthTokenPath(%q): %v", name, err)
+		}
+		client, err := oauthClientPath(name)
+		if err != nil {
+			t.Fatalf("oauthClientPath(%q): %v", name, err)
+		}
+		if path == client {
+			t.Errorf("token and client paths alias for %q: %s", name, path)
+		}
+	}
+
+	// Round trip: each schema is written and read back intact, so neither write
+	// clobbered the other's file.
+	if err := saveRegisteredClient(serverName, "cid-1", "sec-1"); err != nil {
+		t.Fatalf("saveRegisteredClient: %v", err)
+	}
+	if err := NewFileTokenStore(tokenPath).SaveToken(context.Background(), &transport.Token{AccessToken: "tok", RefreshToken: "r"}); err != nil {
+		t.Fatalf("SaveToken: %v", err)
+	}
+	clientID, secret, ok, err := loadRegisteredClient(serverName)
+	if err != nil || !ok || clientID != "cid-1" || secret != "sec-1" {
+		t.Fatalf("registered client after token write = (%q,%q,%v,%v), want (cid-1,sec-1,true,nil)", clientID, secret, ok, err)
+	}
+	token, err := NewFileTokenStore(tokenPath).GetToken(context.Background())
+	if err != nil || token.AccessToken != "tok" {
+		t.Fatalf("token after client write = (%v,%v), want token tok", token, err)
+	}
+}
+
+// A file that holds no access token and no refresh token is not a usable
+// credential, so it reads as "no token" and the daemon asks for authorization.
+func TestGetTokenRejectsNonTokenFile(t *testing.T) {
+	isolateUserConfigDir(t)
+	const serverName = "reviewfix-owner"
+
+	path, err := oauthTokenPath(serverName)
+	if err != nil {
+		t.Fatalf("oauthTokenPath: %v", err)
+	}
+	writeFile(t, path, `{"clientId":"x"}`)
+
+	if _, err := NewFileTokenStore(path).GetToken(context.Background()); !errors.Is(err, transport.ErrNoToken) {
+		t.Fatalf("GetToken on a non-token file = %v, want ErrNoToken", err)
+	}
+}

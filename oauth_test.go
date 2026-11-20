@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -159,5 +161,20 @@ func closeResponse(t *testing.T, response *http.Response) {
 	_, _ = io.Copy(io.Discard, response.Body)
 	if err := response.Body.Close(); err != nil {
 		t.Fatalf("close response body: %v", err)
+	}
+}
+
+// -authorize returns the first Start/Initialize failure unchanged when
+// it is not an auth-required error, so main.go logs it. It must be redacted.
+func TestAuthorizeInteractivelyRedactsNonAuthError(t *testing.T) {
+	t.Parallel()
+
+	urlErr := &url.Error{Op: "Post", URL: "https://mcp.example.com/mcp?key=AUTH_SECRET", Err: errors.New("refused")}
+	got := authorizeInteractively(context.Background(), urlErr, "server", "http://localhost:8090/oauth/callback")
+	if got == nil {
+		t.Fatal("expected the non-auth error to be returned")
+	}
+	if strings.Contains(got.Error(), "AUTH_SECRET") {
+		t.Fatalf("-authorize pass-through leaked the credential: %s", got)
 	}
 }

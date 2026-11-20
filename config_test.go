@@ -412,3 +412,78 @@ func TestLoadInheritsProxyOptions(t *testing.T) {
 		t.Errorf("overridden reconnectInterval = %v, want 2s", got)
 	}
 }
+
+func TestToolFilterIsInheritedFromProxyOptions(t *testing.T) {
+	t.Parallel()
+
+	// A server with no toolFilter of its own inherits mcpProxy.options' one;
+	// a server that sets one keeps it (no merging).
+	dir := t.TempDir()
+	path := dir + "/config.json"
+	writeFile(t, path, `{
+		"mcpProxy": {
+			"baseURL": "http://127.0.0.1:9090",
+			"addr": ":9090",
+			"name": "proxy",
+			"version": "1.0.0",
+			"type": "streamable-http",
+			"options": {"toolFilter": {"mode": "block", "list": ["blocked"]}}
+		},
+		"mcpServers": {
+			"inherits": {"command": "/bin/true"},
+			"own": {"command": "/bin/true", "options": {"toolFilter": {"mode": "block", "list": ["other"]}}}
+		}
+	}`)
+
+	config, err := load(path, false, true, "", 10)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	inherits := config.McpServers["inherits"]
+	if inherits == nil || inherits.Options == nil || inherits.Options.ToolFilter == nil {
+		t.Fatal("server without a toolFilter should inherit mcpProxy.options.toolFilter")
+	}
+	if got := toolFilterFunc("inherits", inherits.Options)("blocked"); got {
+		t.Error("inherited block list must block the listed tool")
+	}
+
+	own := config.McpServers["own"]
+	if own == nil || own.Options == nil || own.Options.ToolFilter == nil {
+		t.Fatal("per-server toolFilter should survive load")
+	}
+	if got := toolFilterFunc("own", own.Options)("blocked"); !got {
+		t.Error("a server's own filter replaces the inherited one, so 'blocked' stays exposed")
+	}
+	if got := toolFilterFunc("own", own.Options)("other"); got {
+		t.Error("the server's own block list must block the listed tool")
+	}
+}
+
+// A malformed downstream URL in config is reported by load(); the parse
+// error embeds the raw URL, so it must be redacted before it is logged/printed.
+func TestValidateHTTPURLRedactsMalformedURLCredential(t *testing.T) {
+	t.Parallel()
+
+	// The second shape is the one that defeated two earlier redactor attempts:
+	// net/url truncates it at the '#', leaving the credential as bare userinfo
+	// with no '@' to detect.
+	for _, raw := range []string{
+		"http://ho st/mcp?key=CFG_SECRET",
+		"https://user:SUPERSECRET#frag@example.com/mcp",
+		"https://user:SUPERSECRET?@example.com/mcp",
+		"//user:NOSCHEMESECRET@ho st/mcp?key=Q",
+		"https://user:SUPERSECRET",
+	} {
+		err := validateHTTPURL("mcpServers[\"bad\"].url", raw)
+		if err == nil {
+			t.Errorf("%q: expected a malformed URL to be rejected", raw)
+			continue
+		}
+		for _, secret := range []string{"CFG_SECRET", "SUPERSECRET", "NOSCHEMESECRET"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("%q leaked %q: %s", raw, secret, err)
+			}
+		}
+	}
+}
