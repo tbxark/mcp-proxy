@@ -485,23 +485,6 @@ type Config struct {
 	McpServers map[string]*MCPClientConfigV2 `json:"mcpServers"`
 }
 
-// FullConfig is the on-the-wire shape: Config plus the two keys of the removed
-// v1 schema, kept only so that loading a v1 file fails with a migration hint
-// instead of the misleading "mcpProxy is required".
-type FullConfig struct {
-	LegacyServerV1  json.RawMessage `json:"server"`
-	LegacyClientsV1 json.RawMessage `json:"clients"`
-
-	McpProxy   *MCPProxyConfigV2             `json:"mcpProxy"`
-	McpServers map[string]*MCPClientConfigV2 `json:"mcpServers"`
-}
-
-// jsonPresent reports whether a key was in the document with a value other
-// than null.
-func jsonPresent(raw json.RawMessage) bool {
-	return len(raw) > 0 && string(raw) != "null"
-}
-
 func newConfProvider(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout int) (provider.Provider, error) {
 	if http.IsRemoteURL(path) {
 		var opts []http.Option
@@ -556,12 +539,9 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 	if err != nil {
 		return nil, err
 	}
-	conf, err := confstore.Load[FullConfig](pro, codec.JsonCodec())
+	conf, err := confstore.Load[Config](pro, codec.JsonCodec())
 	if err != nil {
 		return nil, err
-	}
-	if jsonPresent(conf.LegacyServerV1) || jsonPresent(conf.LegacyClientsV1) {
-		return nil, errors.New(`this looks like a v1 config: the "server" and "clients" keys were removed. Rename them to "mcpProxy" and "mcpServers", and lift each client's "config" object into the server entry itself (see docs/CONFIGURATION.md)`)
 	}
 
 	if conf.McpProxy == nil {

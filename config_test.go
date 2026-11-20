@@ -218,28 +218,6 @@ func TestLoadRejectsInvalidServerConfig(t *testing.T) {
 	}
 }
 
-// The v1 schema is gone. A v1 file has no "mcpProxy" key, so without an
-// explicit check it would fail with "mcpProxy is required" and no hint that
-// the file simply needs migrating.
-func TestLoadRejectsV1Config(t *testing.T) {
-	t.Parallel()
-
-	path := filepath.Join(t.TempDir(), "config.json")
-	data := []byte(`{
-		"server": {"baseURL": "http://localhost:9090", "addr": ":9090", "name": "test", "version": "test"},
-		"clients": {
-			"fetch": {"type": "stdio", "config": {"command": "uvx", "args": ["mcp-server-fetch"]}}
-		}
-	}`)
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	_, err := load(path, false, false, "", 10)
-	if err == nil || !strings.Contains(err.Error(), "mcpServers") {
-		t.Fatalf("load error = %v, want a migration hint naming the v2 keys", err)
-	}
-}
-
 func TestDurationUnmarshal(t *testing.T) {
 	t.Parallel()
 
