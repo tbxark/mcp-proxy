@@ -109,6 +109,12 @@ func TestValidateConfig(t *testing.T) {
 		{name: "unknown filter mode", mutate: func(c *Config) {
 			c.McpServers["stdio"].Options.ToolFilter = &ToolFilterConfig{Mode: "permit", List: []string{"tool"}}
 		}, wantErr: "toolFilter.mode"},
+		{name: "empty allow list", mutate: func(c *Config) {
+			c.McpServers["stdio"].Options.ToolFilter = &ToolFilterConfig{Mode: ToolFilterModeAllow}
+		}, wantErr: "toolFilter.list cannot be empty in allow mode"},
+		{name: "proxy-level disabled", mutate: func(c *Config) {
+			c.McpProxy.Options = &OptionsV2{Disabled: true}
+		}, wantErr: "disabled is only valid per server"},
 		{name: "invalid remote URL", mutate: func(c *Config) {
 			c.McpServers["stdio"] = &MCPClientConfigV2{URL: "://bad", Options: &OptionsV2{}}
 		}, wantErr: "is invalid"},

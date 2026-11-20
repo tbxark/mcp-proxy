@@ -366,6 +366,9 @@ func validateOptions(field string, options *OptionsV2) error {
 	if mode != ToolFilterModeAllow && mode != ToolFilterModeBlock {
 		return fmt.Errorf("%s.toolFilter.mode must be %q or %q", field, ToolFilterModeAllow, ToolFilterModeBlock)
 	}
+	if mode == ToolFilterModeAllow && len(options.ToolFilter.List) == 0 {
+		return fmt.Errorf("%s.toolFilter.list cannot be empty in allow mode", field)
+	}
 	for i, toolName := range options.ToolFilter.List {
 		if strings.TrimSpace(toolName) == "" {
 			return fmt.Errorf("%s.toolFilter.list[%d] cannot be empty", field, i)
@@ -434,6 +437,9 @@ func validateConfig(config *Config) error {
 	}
 	if err := validateDuration("mcpProxy.startupGracePeriod", proxy.StartupGracePeriod); err != nil {
 		return err
+	}
+	if proxy.Options != nil && proxy.Options.Disabled {
+		return errors.New("mcpProxy.options.disabled is only valid per server")
 	}
 	if err := validateOptions("mcpProxy.options", proxy.Options); err != nil {
 		return err
@@ -604,6 +610,9 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 		}
 		if clientConfig.Options.ReconnectInterval == 0 {
 			clientConfig.Options.ReconnectInterval = conf.McpProxy.Options.ReconnectInterval
+		}
+		if clientConfig.Options.ToolFilter == nil {
+			clientConfig.Options.ToolFilter = conf.McpProxy.Options.ToolFilter
 		}
 	}
 

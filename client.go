@@ -903,11 +903,11 @@ func (c *Client) startPingTask(ctx context.Context) {
 
 // toolFilterFunc builds the tool exposure predicate for one client.
 //
-// Behavior is deliberately unchanged from earlier releases so an upgrade cannot
-// start hiding tools a deployment relies on: a filter only takes effect when it
-// has a non-empty list (so an empty list means "no filtering", including
-// mode=allow), and an unrecognized mode skips filtering. Both cases log a
-// warning so an inert or over-broad filter is not silent.
+// With no filter every tool is exposed. mode=allow exposes exactly the listed
+// tools (validation requires a non-empty list) and mode=block hides the listed
+// ones. An unrecognized mode cannot come from a validated config - it means
+// the OptionsV2 was built programmatically - so it fails closed, exposing
+// nothing, with a warning.
 func toolFilterFunc(name string, options *OptionsV2) func(string) bool {
 	if options == nil || options.ToolFilter == nil {
 		return func(string) bool { return true }
@@ -918,11 +918,6 @@ func toolFilterFunc(name string, options *OptionsV2) func(string) bool {
 	}
 	switch mode := ToolFilterMode(strings.ToLower(string(options.ToolFilter.Mode))); mode {
 	case ToolFilterModeAllow:
-		if len(filterSet) == 0 {
-			slog.Warn("toolFilter mode=allow with an empty list exposes every tool; list the tools to expose, or use mode=block",
-				"client", name)
-			return func(string) bool { return true }
-		}
 		return func(toolName string) bool {
 			_, inList := filterSet[toolName]
 			if !inList {
@@ -939,11 +934,8 @@ func toolFilterFunc(name string, options *OptionsV2) func(string) bool {
 			return !inList
 		}
 	default:
-		// validateConfig rejects unknown modes, so this only happens for a
-		// programmatically built config. Preserve the historical behavior (no
-		// filtering) but make it visible.
-		slog.Warn("Unknown tool filter mode, skipping tool filter", "client", name, "mode", mode)
-		return func(string) bool { return true }
+		slog.Warn("Unknown tool filter mode, hiding all tools", "client", name, "mode", mode)
+		return func(string) bool { return false }
 	}
 }
 

@@ -97,12 +97,9 @@ func serverResourceTemplateNames(t *testing.T, mcpServer *server.MCPServer) []st
 	return names
 }
 
-func TestToolFilterFuncPreservesCompatibility(t *testing.T) {
+func TestToolFilterFunc(t *testing.T) {
 	t.Parallel()
 
-	// These expectations intentionally encode the PRE-EXISTING behavior: an
-	// upgrade must not start hiding tools a deployment relies on. Do not tighten
-	// any of these without a major release.
 	tests := []struct {
 		name    string
 		options *OptionsV2
@@ -111,12 +108,13 @@ func TestToolFilterFuncPreservesCompatibility(t *testing.T) {
 	}{
 		{name: "nil options allows", options: nil, tool: "any", want: true},
 		{name: "nil filter allows", options: &OptionsV2{}, tool: "any", want: true},
-		{name: "empty allow list still allows (legacy)", options: &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterModeAllow}}, tool: "any", want: true},
 		{name: "allow list membership", options: &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterModeAllow, List: []string{"a"}}}, tool: "a", want: true},
 		{name: "allow list exclusion", options: &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterModeAllow, List: []string{"a"}}}, tool: "b", want: false},
 		{name: "empty block list allows", options: &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterModeBlock}}, tool: "any", want: true},
 		{name: "block list excludes", options: &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterModeBlock, List: []string{"b"}}}, tool: "b", want: false},
-		{name: "unknown mode still allows (legacy)", options: &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterMode("nonsense")}}, tool: "any", want: true},
+		// Validation rejects unknown modes, so this is only reachable with a
+		// programmatically built config; it fails closed.
+		{name: "unknown mode hides all", options: &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterMode("nonsense")}}, tool: "any", want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -124,34 +122,6 @@ func TestToolFilterFuncPreservesCompatibility(t *testing.T) {
 				t.Errorf("toolFilterFunc(%s)(%s) = %v, want %v", tt.name, tt.tool, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestEmptyAllowListStillExposesAllTools(t *testing.T) {
-	t.Parallel()
-
-	// Compatibility guard: an empty allow list historically meant "no filtering"
-	// and still does, so an existing deployment keeps seeing every tool. The
-	// surprising case is logged as a warning instead of changing behavior.
-	downstream := newRawDownstream(t)
-	downstream.setTools("alpha", "beta")
-
-	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
-		TransportType: MCPClientTypeStreamable,
-		URL:           downstream.url,
-		Options:       &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterModeAllow}},
-	})
-	if err != nil {
-		t.Fatalf("newMCPClient: %v", err)
-	}
-	defer func() { _ = mcpClient.Close() }()
-
-	proxyServer := newProxyServerForTest(t)
-	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
-		t.Fatalf("addToMCPServer: %v", err)
-	}
-	if got := serverToolNames(t, proxyServer); !slices.Equal(got, []string{"alpha", "beta"}) {
-		t.Fatalf("tools with an empty allow list = %v, want [alpha beta] (legacy behavior)", got)
 	}
 }
 
@@ -363,13 +333,11 @@ func TestToolCallErrorRedactsURLCredential(t *testing.T) {
 	}
 }
 
-func TestGlobalToolFilterIsNotInherited(t *testing.T) {
+func TestToolFilterIsInheritedFromProxyOptions(t *testing.T) {
 	t.Parallel()
 
-	// Compatibility guard: mcpProxy.options.toolFilter is NOT applied to
-	// servers. Enforcing it would newly hide tools on an existing deployment,
-	// so it remains a no-op reported via a warning. This test pins that
-	// behavior; changing it is a breaking change needing a major release.
+	// A server with no toolFilter of its own inherits mcpProxy.options' one;
+	// a server that sets one keeps it (no merging).
 	dir := t.TempDir()
 	path := dir + "/config.json"
 	writeFile(t, path, `{
@@ -382,7 +350,8 @@ func TestGlobalToolFilterIsNotInherited(t *testing.T) {
 			"options": {"toolFilter": {"mode": "block", "list": ["blocked"]}}
 		},
 		"mcpServers": {
-			"inherits": {"command": "/bin/true"}
+			"inherits": {"command": "/bin/true"},
+			"own": {"command": "/bin/true", "options": {"toolFilter": {"mode": "block", "list": ["other"]}}}
 		}
 	}`)
 
@@ -391,33 +360,23 @@ func TestGlobalToolFilterIsNotInherited(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 
-	server := config.McpServers["inherits"]
-	if server == nil || server.Options == nil {
-		t.Fatal("server options should be defaulted after load")
+	inherits := config.McpServers["inherits"]
+	if inherits == nil || inherits.Options == nil || inherits.Options.ToolFilter == nil {
+		t.Fatal("server without a toolFilter should inherit mcpProxy.options.toolFilter")
 	}
-	if server.Options.ToolFilter != nil {
-		t.Fatalf("global toolFilter must not be inherited, got %+v", server.Options.ToolFilter)
-	}
-	// The practical consequence: the globally "blocked" tool stays exposed.
-	if got := toolFilterFunc("inherits", server.Options)("blocked"); !got {
-		t.Error("legacy behavior exposes 'blocked' even with a global block list")
+	if got := toolFilterFunc("inherits", inherits.Options)("blocked"); got {
+		t.Error("inherited block list must block the listed tool")
 	}
 
-	// A per-server filter is the supported way to restrict tools, and works.
-	writeFile(t, path, `{
-		"mcpProxy": {"baseURL": "http://127.0.0.1:9090","addr": ":9090","name": "proxy","version": "1.0.0","type": "streamable-http"},
-		"mcpServers": {"restricted": {"command": "/bin/true", "options": {"toolFilter": {"mode": "block", "list": ["blocked"]}}}}
-	}`)
-	config, err = load(path, false, true, "", 10)
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	restricted := config.McpServers["restricted"]
-	if restricted == nil || restricted.Options == nil || restricted.Options.ToolFilter == nil {
+	own := config.McpServers["own"]
+	if own == nil || own.Options == nil || own.Options.ToolFilter == nil {
 		t.Fatal("per-server toolFilter should survive load")
 	}
-	if got := toolFilterFunc("restricted", restricted.Options)("blocked"); got {
-		t.Error("per-server block list must still block the excluded tool")
+	if got := toolFilterFunc("own", own.Options)("blocked"); !got {
+		t.Error("a server's own filter replaces the inherited one, so 'blocked' stays exposed")
+	}
+	if got := toolFilterFunc("own", own.Options)("other"); got {
+		t.Error("the server's own block list must block the listed tool")
 	}
 }
 
