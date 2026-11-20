@@ -46,6 +46,7 @@
       }
     },
     "amap": {
+      "transportType": "sse",
       "url": "https://mcp.amap.com/sse?key=<YOUR_TOKEN>"
     }
   }

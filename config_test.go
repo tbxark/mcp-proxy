@@ -39,7 +39,8 @@ func TestParseMCPClientConfigV2(t *testing.T) {
 		want    any
 	}{
 		{name: "infer stdio", config: &MCPClientConfigV2{Command: "server"}, want: &StdioMCPClientConfig{}},
-		{name: "infer sse", config: &MCPClientConfigV2{URL: "https://example.com/sse"}, want: &SSEMCPClientConfig{}},
+		{name: "infer streamable", config: &MCPClientConfigV2{URL: "https://example.com/mcp"}, want: &StreamableMCPClientConfig{}},
+		{name: "explicit sse", config: &MCPClientConfigV2{TransportType: MCPClientTypeSSE, URL: "https://example.com/sse"}, want: &SSEMCPClientConfig{}},
 		{name: "explicit streamable", config: &MCPClientConfigV2{TransportType: MCPClientTypeStreamable, URL: "https://example.com/mcp"}, want: &StreamableMCPClientConfig{}},
 		{name: "null", config: nil, wantErr: "server config is null"},
 		{name: "ambiguous", config: &MCPClientConfigV2{Command: "server", URL: "https://example.com"}, wantErr: "mutually exclusive"},
@@ -190,6 +191,42 @@ func TestNewConfProviderLeavesDefaultClientUntouched(t *testing.T) {
 	}
 	if nethttp.DefaultClient.Timeout != timeout {
 		t.Fatalf("http.DefaultClient.Timeout = %v, want unchanged %v", nethttp.DefaultClient.Timeout, timeout)
+	}
+}
+
+// Defaults: an omitted mcpProxy.type means streamable-http, and a url-only
+// server means a streamable-http downstream.
+func TestLoadDefaultsToStreamableHTTP(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := []byte(`{
+		"mcpProxy": {
+			"baseURL": "http://localhost:9090",
+			"addr": ":9090",
+			"name": "test",
+			"version": "test"
+		},
+		"mcpServers": {
+			"remote": {"url": "https://example.com/mcp"}
+		}
+	}`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	config, err := load(path, false, false, "", 10)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if config.McpProxy.Type != MCPServerTypeStreamable {
+		t.Errorf("mcpProxy.type = %q, want %q", config.McpProxy.Type, MCPServerTypeStreamable)
+	}
+	parsed, err := parseMCPClientConfigV2(config.McpServers["remote"])
+	if err != nil {
+		t.Fatalf("parse remote server: %v", err)
+	}
+	if _, ok := parsed.(*StreamableMCPClientConfig); !ok {
+		t.Errorf("url-only server parsed as %T, want *StreamableMCPClientConfig", parsed)
 	}
 }
 

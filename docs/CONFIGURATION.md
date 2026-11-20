@@ -13,7 +13,7 @@ This project uses the JSON configuration below.
     "addr": ":9090",
     "name": "MCP Proxy",
     "version": "1.0.0",
-    "type": "streamable-http", // or "sse" (default)
+    "type": "streamable-http", // (default) or "sse"
     "options": {
       "panicIfInvalid": false,
       "logEnabled": true,
@@ -46,6 +46,7 @@ This project uses the JSON configuration below.
     },
     "amap": {
       // SSE client with the token in the URL query (amap only accepts a key this way)
+      "transportType": "sse",
       "url": "https://mcp.amap.com/sse?key=<YOUR_TOKEN>"
     },
     "notion": {
@@ -66,7 +67,7 @@ This project uses the JSON configuration below.
 - `baseURL`: Public URL base used to build client endpoints.
 - `addr`: Bind address (e.g. `:9090`).
 - `name`, `version`: Server identity for MCP handshake.
-- `type`: `sse` (default) or `streamable-http`.
+- `type`: `streamable-http` (default) or `sse`.
 - `options`: Defaults inherited by `mcpServers.*.options` (can be overridden per server).
 - `startupGracePeriod` (duration string, default `"30s"`): how long `/_readyz` reports
   `initializing` while clients are still connecting. After it, the proxy reports ready
@@ -84,8 +85,8 @@ or contain `\`, `{`, `}` or control characters. Multiple segments are allowed
 Each entry defines a downstream MCP server. Supported client types:
 
 - `stdio` (implicit when `command` is set): run a subprocess via stdio.
-- `sse` (implicit when `url` is set and `transportType` ≠ `streamable-http`): connect via Server‑Sent Events.
-- `streamable-http` (requires `transportType: "streamable-http"`): connect via HTTP streaming.
+- `streamable-http` (implicit when `url` is set and `transportType` ≠ `sse`): connect via HTTP streaming.
+- `sse` (requires `transportType: "sse"`): connect via Server‑Sent Events.
 
 Common fields:
 

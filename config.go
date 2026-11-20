@@ -247,7 +247,7 @@ func parseMCPClientConfigV2(conf *MCPClientConfigV2) (any, error) {
 		case conf.Command != "":
 			transportType = MCPClientTypeStdio
 		case conf.URL != "":
-			transportType = MCPClientTypeSSE
+			transportType = MCPClientTypeStreamable
 		default:
 			return nil, errors.New("command or url is required")
 		}
@@ -581,7 +581,7 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 	}
 
 	if conf.McpProxy.Type == "" {
-		conf.McpProxy.Type = MCPServerTypeSSE // default to SSE
+		conf.McpProxy.Type = MCPServerTypeStreamable // default to streamable-http
 	}
 
 	config := &Config{

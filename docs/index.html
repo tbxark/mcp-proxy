@@ -224,7 +224,7 @@
             throw new Error('Invalid or missing baseURL in mcpProxy configuration');
         }
         const baseUrlObj = new URL(baseURL);
-        const suffix = fromConfig?.mcpProxy?.type === 'streamable-http' ? 'mcp' : 'sse';
+        const suffix = fromConfig?.mcpProxy?.type === 'sse' ? 'sse' : 'mcp';
         const servers = [];
         for (const key of Object.keys(mcpServers)) {
             if (mcpServers[key]?.options?.disabled === true) {
