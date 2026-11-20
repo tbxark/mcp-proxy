@@ -107,7 +107,13 @@ func startDownstreamOnAddr(t *testing.T, addr, transportType string) *httptest.S
 			downstream := httptest.NewUnstartedServer(handler)
 			downstream.Listener = listener
 			downstream.Start()
-			t.Cleanup(downstream.Close)
+			// CloseClientConnections drops the proxy's subscriptions/listen
+			// stream, which otherwise stays open until the proxy dies and
+			// would hang Close (the downstream teardown can run first).
+			t.Cleanup(func() {
+				downstream.CloseClientConnections()
+				downstream.Close()
+			})
 			return downstream
 		}
 		if time.Now().After(deadline) {

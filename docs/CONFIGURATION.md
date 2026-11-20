@@ -117,6 +117,17 @@ Common fields:
 - `oauth` — for `sse` and `streamable-http` clients that require interactive OAuth instead of (or in addition to) `headers` (see below).
 - `options` — per‑server overrides and filters (see below).
 
+When a downstream server announces that its tools, prompts, or resources
+changed (`notifications/*/list_changed`), the proxy re-lists and re-publishes
+that server's catalog, so downstream changes are picked up live without a
+restart. Two limitations apply: a legacy `streamable-http` downstream only
+delivers notifications that ride on an in-flight request's response stream,
+and mcp-go-based downstreams (v1.1.0) speaking the 2026-07-28 protocol over
+streamable HTTP currently never send list_changed to subscribers, so for them
+the catalog still only refreshes on reconnect. Progress and logging
+notifications, and server-initiated sampling, elicitation, and roots requests,
+are not forwarded.
+
 ## oauth
 
 Some remote MCP servers (e.g. Notion's hosted MCP) require the full OAuth

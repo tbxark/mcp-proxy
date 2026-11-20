@@ -42,6 +42,12 @@ Given `mcpProxy.baseURL = https://mcp.example.com` and a server key `fetch`:
 - For `type: sse`: `https://mcp.example.com/fetch/sse`
 - For `type: streamable-http`: `https://mcp.example.com/fetch/mcp`
 
+When a downstream announces that its tools, prompts, or resources changed, the
+proxy re-lists them and the new catalog is served live — see the note in
+[CONFIGURATION.md](CONFIGURATION.md#mcpservers) for the cases where
+notifications cannot arrive. Progress/logging notifications and
+server-initiated sampling, elicitation, and roots requests are not forwarded.
+
 ## Health checks
 
 Two unauthenticated endpoints are always served for liveness/readiness probes

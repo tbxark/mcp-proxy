@@ -103,6 +103,11 @@ type Client struct {
 	// same dead transport rebuild it once.
 	recoverMu sync.Mutex
 
+	// refreshMu serializes catalog refreshes triggered by downstream
+	// list_changed notifications, so a burst of them re-lists one at a time
+	// rather than interleaving Set calls.
+	refreshMu sync.Mutex
+
 	// retired holds replaced streamable-http transports until retireGrace has
 	// passed; see retire.
 	retiredMu sync.Mutex
@@ -258,6 +263,14 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 		}
 	}
 
+	// A list_changed notification from the downstream refreshes the proxied
+	// catalog. It is registered before Start so nothing the transport receives
+	// while connecting is missed; onDownstreamNotification drops anything
+	// arriving on a transport that has since been replaced.
+	raw.OnNotification(func(n mcp.JSONRPCNotification) {
+		c.onDownstreamNotification(raw, n)
+	})
+
 	connected := false
 	// Until the swap below succeeds, this transport is not owned by the client
 	// and must be closed on the way out.
@@ -327,6 +340,38 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 	}
 	slog.Info("Successfully initialized MCP client", "client", c.name)
 
+	// Modern protocol versions require the client to opt in to the
+	// notification types it wants: subscriptions/listen is how they arrive.
+	// Opt in to the list_changed types the downstream says it can send (legacy
+	// connections push them without an opt-in). lifeCtx is set by
+	// addToMCPServer before connect runs; a nil lifeCtx means there is no
+	// long-lived scope to hold the stream open, so skip.
+	//
+	// stdio is exempt: its request stream is bidirectional, so a downstream
+	// pushes notifications over the same pipe without a stream to opt in to.
+	// An mcp-go stdio downstream registers a session that receives broadcasts
+	// unfiltered, and serving subscriptions/listen would occupy its serial
+	// reader until shutdown, deadlocking every later request.
+	_, stdio := c.clientConf.(*StdioMCPClientConfig)
+	if c.lifeCtx != nil && !stdio && mcp.IsModernProtocol(raw.ProtocolVersion()) {
+		var filter mcp.SubscriptionFilter
+		capabilities := initResult.Capabilities
+		if capabilities.Tools != nil && capabilities.Tools.ListChanged {
+			filter.ToolsListChanged = true
+		}
+		if capabilities.Prompts != nil && capabilities.Prompts.ListChanged {
+			filter.PromptsListChanged = true
+		}
+		if capabilities.Resources != nil && capabilities.Resources.ListChanged {
+			filter.ResourcesListChanged = true
+		}
+		if !filter.IsEmpty() {
+			_, _ = raw.ListenAsync(c.lifeCtx, filter, func(err error) {
+				slog.Debug("Notification stream ended", "client", c.name, "err", redactURLCredentials(err))
+			})
+		}
+	}
+
 	// Bound the catalog discovery so a downstream that answers initialize and
 	// then goes silent cannot wedge this attempt (and the retry loop with it).
 	// The transports use this ctx per request, so it does not tear down the
@@ -352,6 +397,56 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 
 	c.health.Store(int32(healthOK))
 	return nil
+}
+
+// onDownstreamNotification handles a notification received on transport raw.
+// Notifications arriving on a retired transport are dropped: only the live
+// one can refresh the catalog. The refresh runs in its own goroutine so the
+// transport's reader is never blocked, and refreshes are serialized by
+// refreshMu so a burst of list_changed notifications re-lists one at a time.
+func (c *Client) onDownstreamNotification(raw *client.Client, n mcp.JSONRPCNotification) {
+	if raw != c.getClient() {
+		return
+	}
+	var refresh func(ctx context.Context, mcpServer *server.MCPServer) error
+	var kind string
+	switch n.Method {
+	case string(mcp.MethodNotificationToolsListChanged):
+		kind, refresh = "tools", c.addToolsToServer
+	case string(mcp.MethodNotificationPromptsListChanged):
+		kind, refresh = "prompts", c.addPromptsToServer
+	case string(mcp.MethodNotificationResourcesListChanged):
+		kind = "resources"
+		refresh = func(ctx context.Context, mcpServer *server.MCPServer) error {
+			if err := c.addResourcesToServer(ctx, mcpServer); err != nil {
+				return err
+			}
+			return c.addResourceTemplatesToServer(ctx, mcpServer)
+		}
+	default:
+		return
+	}
+	mcpServer := c.mcpServer
+	if mcpServer == nil {
+		return
+	}
+	go func() {
+		lifeCtx := c.lifeCtx
+		if lifeCtx == nil || lifeCtx.Err() != nil || c.closed.Load() {
+			return
+		}
+		c.refreshMu.Lock()
+		defer c.refreshMu.Unlock()
+		ctx, cancel := context.WithTimeout(lifeCtx, catalogTimeout)
+		defer cancel()
+		if err := c.registerCatalogSafely(func() error {
+			return refresh(ctx, mcpServer)
+		}); err != nil {
+			slog.Warn("Failed to refresh downstream catalog", "client", c.name, "kind", kind, "err", redactURLCredentials(err))
+			return
+		}
+		slog.Info("Refreshed downstream catalog", "client", c.name, "kind", kind)
+	}()
 }
 
 // registerCatalogSafely runs fn and converts a panic caused by
@@ -1408,6 +1503,10 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 		// The proxy does not forward resources/subscribe nor emit
 		// resources/updated, so only listChanged is advertised.
 		server.WithResourceCapabilities(false, true),
+		// tools/list_changed and prompts/list_changed are emitted when a
+		// downstream's list_changed notification re-registers the catalog.
+		server.WithToolCapabilities(true),
+		server.WithPromptCapabilities(true),
 		server.WithRecovery(),
 	}
 	mcpServer := server.NewMCPServer(

@@ -2020,3 +2020,198 @@ func TestEmptyAllowListHidesAllResourcesAndPrompts(t *testing.T) {
 		t.Errorf("tools = %v, want [alpha]", got)
 	}
 }
+
+// waitForTools polls the proxy-side tool list until it equals want or ~5s
+// pass; a list_changed notification refreshes asynchronously, so the update
+// cannot be observed synchronously.
+func waitForTools(t *testing.T, mcpServer *server.MCPServer, want []string) []string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := serverToolNames(t, mcpServer)
+		if slices.Equal(got, want) {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tools = %v after 5s, want %v", got, want)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// newListChangedDownstream builds an in-process mcp-go downstream that
+// advertises tools and prompts listChanged but NOT resources listChanged, on
+// the given transport, plus a connected proxy client + proxy server pair.
+func newListChangedDownstream(t *testing.T, transportType string, extraOpts ...server.ServerOption) (*server.MCPServer, *Client, *server.MCPServer) {
+	t.Helper()
+
+	opts := append([]server.ServerOption{
+		server.WithToolCapabilities(true),
+		server.WithPromptCapabilities(true),
+		server.WithResourceCapabilities(true, false),
+	}, extraOpts...)
+	downstream := server.NewMCPServer("downstream", "1.0.0", opts...)
+	downstream.AddTool(mcp.NewTool("alpha"),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("a"), nil
+		})
+
+	conf := &MCPClientConfigV2{Options: &OptionsV2{}}
+	var httpServer *httptest.Server
+	if transportType == "sse" {
+		conf.TransportType = MCPClientTypeSSE
+		httpServer = httptest.NewServer(server.NewSSEServer(downstream))
+		conf.URL = httpServer.URL + "/sse"
+	} else {
+		conf.TransportType = MCPClientTypeStreamable
+		httpServer = httptest.NewServer(server.NewStreamableHTTPServer(downstream))
+		conf.URL = httpServer.URL + "/mcp"
+	}
+	t.Cleanup(httpServer.Close)
+
+	mcpClient, err := newMCPClient("test", conf)
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	t.Cleanup(func() { _ = mcpClient.Close() })
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	if got := serverToolNames(t, proxyServer); !slices.Equal(got, []string{"alpha"}) {
+		t.Fatalf("initial tools = %v, want [alpha]", got)
+	}
+	return downstream, mcpClient, proxyServer
+}
+
+// A legacy SSE downstream pushes list_changed over its event stream; the proxy
+// refreshes and re-publishes the catalog end to end.
+func TestListChangedRefreshesCatalog(t *testing.T) {
+	t.Parallel()
+
+	downstream, _, proxyServer := newListChangedDownstream(t, "sse")
+
+	downstream.AddTool(mcp.NewTool("beta"),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("b"), nil
+		})
+	waitForTools(t, proxyServer, []string{"alpha", "beta"})
+}
+
+// On a modern (2026-07-28) connection the proxy opts in to list_changed via
+// subscriptions/listen, intersected with the capabilities the downstream
+// advertised: tools and prompts here, not resources.
+func TestModernDownstreamOptsIntoListChanged(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var filters []mcp.SubscriptionFilter
+	hooks := &server.Hooks{}
+	hooks.AddBeforeAny(func(ctx context.Context, id any, method mcp.MCPMethod, message any) {
+		if method != mcp.MethodSubscriptionsListen {
+			return
+		}
+		request, ok := message.(*mcp.SubscriptionsListenRequest)
+		if !ok {
+			return
+		}
+		mu.Lock()
+		filters = append(filters, request.Params.Notifications)
+		mu.Unlock()
+	})
+
+	_, _, _ = newListChangedDownstream(t, "streamable-http", server.WithHooks(hooks))
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		got := slices.Clone(filters)
+		mu.Unlock()
+		if len(got) > 0 {
+			filter := got[len(got)-1]
+			if !filter.ToolsListChanged || !filter.PromptsListChanged ||
+				filter.ResourcesListChanged || len(filter.ResourceSubscriptions) > 0 {
+				t.Fatalf("subscriptions/listen filter = %+v, want only tools+prompts list_changed", filter)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("downstream received no subscriptions/listen within 5s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// On a modern streamable-http connection the downstream's list_changed must
+// refresh the proxy catalog. mcp-go v1.1.0 never broadcasts notifications to
+// the ephemeral sessions its modern streamable transport creates, so the
+// notification a compliant downstream would push is injected here instead.
+func TestListChangedNotificationRefreshesCatalog(t *testing.T) {
+	t.Parallel()
+
+	downstream, mcpClient, proxyServer := newListChangedDownstream(t, "streamable-http")
+
+	downstream.AddTool(mcp.NewTool("beta"),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("b"), nil
+		})
+	mcpClient.onDownstreamNotification(mcpClient.getClient(), mcp.JSONRPCNotification{
+		Notification: mcp.Notification{Method: string(mcp.MethodNotificationToolsListChanged)},
+	})
+	waitForTools(t, proxyServer, []string{"alpha", "beta"})
+}
+
+// A notification arriving on a transport that is no longer the live one (e.g.
+// a retired connection draining in-flight requests) must not refresh.
+func TestListChangedOnNonLiveClientIsIgnored(t *testing.T) {
+	t.Parallel()
+
+	downstream := server.NewMCPServer("downstream", "1.0.0", server.WithToolCapabilities(true))
+	downstream.AddTool(mcp.NewTool("alpha"),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("a"), nil
+		})
+	httpServer := httptest.NewServer(server.NewStreamableHTTPServer(downstream))
+	t.Cleanup(httpServer.Close)
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           httpServer.URL + "/mcp",
+		Options:       &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+
+	other, err := newRawClient("test", &StreamableMCPClientConfig{URL: httpServer.URL + "/mcp"})
+	if err != nil {
+		t.Fatalf("newRawClient: %v", err)
+	}
+	defer func() { _ = other.Close() }()
+
+	downstream.AddTool(mcp.NewTool("beta"),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("b"), nil
+		})
+	// Inject the notification as if it arrived on the non-live transport: it
+	// must be dropped, and "beta" must not appear via that path.
+	mcpClient.onDownstreamNotification(other, mcp.JSONRPCNotification{
+		Notification: mcp.Notification{Method: string(mcp.MethodNotificationToolsListChanged)},
+	})
+	time.Sleep(300 * time.Millisecond)
+	if got := serverToolNames(t, proxyServer); !slices.Equal(got, []string{"alpha"}) {
+		t.Fatalf("tools = %v after stale notification, want [alpha]", got)
+	}
+	// Sanity: a notification on the live transport does refresh.
+	mcpClient.onDownstreamNotification(mcpClient.getClient(), mcp.JSONRPCNotification{
+		Notification: mcp.Notification{Method: string(mcp.MethodNotificationToolsListChanged)},
+	})
+	waitForTools(t, proxyServer, []string{"alpha", "beta"})
+}
