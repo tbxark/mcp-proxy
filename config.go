@@ -171,24 +171,34 @@ const (
 
 // ---- V2 ----
 
-type ToolFilterMode string
+// FilterMode selects how a FilterConfig's list is applied.
+type FilterMode string
 
 const (
-	ToolFilterModeAllow ToolFilterMode = "allow"
-	ToolFilterModeBlock ToolFilterMode = "block"
+	FilterModeAllow FilterMode = "allow"
+	FilterModeBlock FilterMode = "block"
 )
 
-type ToolFilterConfig struct {
-	Mode ToolFilterMode `json:"mode,omitempty"`
-	List []string       `json:"list,omitempty"`
+// FilterConfig is the allow/block list shape shared by toolFilter,
+// resourceFilter and promptFilter.
+type FilterConfig struct {
+	Mode FilterMode `json:"mode,omitempty"`
+	List []string   `json:"list,omitempty"`
 }
 
 type OptionsV2 struct {
 	PanicIfInvalid optional.Field[bool] `json:"panicIfInvalid"`
 	LogEnabled     optional.Field[bool] `json:"logEnabled"`
 	AuthTokens     []string             `json:"authTokens,omitempty"`
-	ToolFilter     *ToolFilterConfig    `json:"toolFilter,omitempty"`
-	Disabled       bool                 `json:"disabled,omitempty"`
+	ToolFilter     *FilterConfig        `json:"toolFilter,omitempty"`
+	// ResourceFilter selects which resources and resource templates are
+	// exposed. List entries match a resource's URI or name, or a template's
+	// uriTemplate or name.
+	ResourceFilter *FilterConfig `json:"resourceFilter,omitempty"`
+	// PromptFilter selects which prompts are exposed, by prompt name, with
+	// the same semantics as ResourceFilter.
+	PromptFilter *FilterConfig `json:"promptFilter,omitempty"`
+	Disabled     bool          `json:"disabled,omitempty"`
 	// PingInterval is how often this connection is probed to keep it alive and
 	// to notice that it died; it sets how quickly /_readyz reports degraded.
 	PingInterval Duration `json:"pingInterval,omitempty"`
@@ -343,19 +353,31 @@ func validateOptions(field string, options *OptionsV2) error {
 			return fmt.Errorf("%s.authTokens[%d] cannot be empty", field, i)
 		}
 	}
-	if options.ToolFilter == nil {
+	if err := validateFilter(field+".toolFilter", options.ToolFilter); err != nil {
+		return err
+	}
+	if err := validateFilter(field+".resourceFilter", options.ResourceFilter); err != nil {
+		return err
+	}
+	return validateFilter(field+".promptFilter", options.PromptFilter)
+}
+
+// validateFilter checks one allow/block list. A nil filter is valid and means
+// "no filtering".
+func validateFilter(field string, filter *FilterConfig) error {
+	if filter == nil {
 		return nil
 	}
-	mode := ToolFilterMode(strings.ToLower(string(options.ToolFilter.Mode)))
-	if mode != ToolFilterModeAllow && mode != ToolFilterModeBlock {
-		return fmt.Errorf("%s.toolFilter.mode must be %q or %q", field, ToolFilterModeAllow, ToolFilterModeBlock)
+	mode := FilterMode(strings.ToLower(string(filter.Mode)))
+	if mode != FilterModeAllow && mode != FilterModeBlock {
+		return fmt.Errorf("%s.mode must be %q or %q", field, FilterModeAllow, FilterModeBlock)
 	}
-	if mode == ToolFilterModeAllow && len(options.ToolFilter.List) == 0 {
-		return fmt.Errorf("%s.toolFilter.list cannot be empty in allow mode", field)
+	if mode == FilterModeAllow && len(filter.List) == 0 {
+		return fmt.Errorf("%s.list cannot be empty in allow mode", field)
 	}
-	for i, toolName := range options.ToolFilter.List {
-		if strings.TrimSpace(toolName) == "" {
-			return fmt.Errorf("%s.toolFilter.list[%d] cannot be empty", field, i)
+	for i, name := range filter.List {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("%s.list[%d] cannot be empty", field, i)
 		}
 	}
 	return nil
@@ -577,6 +599,12 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 		}
 		if clientConfig.Options.ToolFilter == nil {
 			clientConfig.Options.ToolFilter = conf.McpProxy.Options.ToolFilter
+		}
+		if clientConfig.Options.ResourceFilter == nil {
+			clientConfig.Options.ResourceFilter = conf.McpProxy.Options.ResourceFilter
+		}
+		if clientConfig.Options.PromptFilter == nil {
+			clientConfig.Options.PromptFilter = conf.McpProxy.Options.PromptFilter
 		}
 	}
 

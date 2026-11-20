@@ -105,10 +105,10 @@ func TestValidateConfig(t *testing.T) {
 		{name: "unknown proxy type", mutate: func(c *Config) { c.McpProxy.Type = "websocket" }, wantErr: "mcpProxy.type"},
 		{name: "empty token", mutate: func(c *Config) { c.McpServers["stdio"].Options.AuthTokens = []string{""} }, wantErr: "authTokens[0]"},
 		{name: "unknown filter mode", mutate: func(c *Config) {
-			c.McpServers["stdio"].Options.ToolFilter = &ToolFilterConfig{Mode: "permit", List: []string{"tool"}}
+			c.McpServers["stdio"].Options.ToolFilter = &FilterConfig{Mode: "permit", List: []string{"tool"}}
 		}, wantErr: "toolFilter.mode"},
 		{name: "empty allow list", mutate: func(c *Config) {
-			c.McpServers["stdio"].Options.ToolFilter = &ToolFilterConfig{Mode: ToolFilterModeAllow}
+			c.McpServers["stdio"].Options.ToolFilter = &FilterConfig{Mode: FilterModeAllow}
 		}, wantErr: "toolFilter.list cannot be empty in allow mode"},
 		{name: "proxy-level disabled", mutate: func(c *Config) {
 			c.McpProxy.Options = &OptionsV2{Disabled: true}
@@ -520,6 +520,32 @@ func TestValidateHTTPURLRedactsMalformedURLCredential(t *testing.T) {
 		for _, secret := range []string{"CFG_SECRET", "SUPERSECRET", "NOSCHEMESECRET"} {
 			if strings.Contains(err.Error(), secret) {
 				t.Errorf("%q leaked %q: %s", raw, secret, err)
+			}
+		}
+	}
+}
+
+func TestValidateConfigRejectsBadResourceAndPromptFilters(t *testing.T) {
+	t.Parallel()
+
+	for _, field := range []string{"resourceFilter", "promptFilter"} {
+		for _, tc := range []struct {
+			filter  *FilterConfig
+			wantErr string
+		}{
+			{filter: &FilterConfig{Mode: "permit"}, wantErr: field + ".mode"},
+			{filter: &FilterConfig{Mode: FilterModeAllow}, wantErr: field + ".list cannot be empty in allow mode"},
+			{filter: &FilterConfig{Mode: FilterModeBlock, List: []string{" "}}, wantErr: field + ".list[0]"},
+		} {
+			options := &OptionsV2{}
+			if field == "resourceFilter" {
+				options.ResourceFilter = tc.filter
+			} else {
+				options.PromptFilter = tc.filter
+			}
+			err := validateOptions("mcpServers[\"s\"].options", options)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("%s: err = %v, want it to mention %q", field, err, tc.wantErr)
 			}
 		}
 	}

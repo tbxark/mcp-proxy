@@ -83,6 +83,12 @@ type Client struct {
 	// pingDone is closed when the keepalive loop exits; nil if none started.
 	pingDone chan struct{}
 
+	// blockedURIs holds the normalized URIs a block-mode resourceFilter hides,
+	// checked again on every read (see resourceReadAllowed). nil means no
+	// block-mode filter. Rebuilt on every catalog registration.
+	blockedMu   sync.RWMutex
+	blockedURIs map[string]struct{}
+
 	// lifeCtx is the long-lived context given to addToMCPServer. A rebuild
 	// triggered from a forwarded request must not use that request's context:
 	// Start ties the new transport to the context it receives.
@@ -161,6 +167,9 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 	}
 	// The first transport is built here: for stdio that spawns the subprocess,
 	// so a missing command fails at startup rather than on first use.
+	// Block listed URIs from the start, so a read through a template is refused
+	// even if listing the downstream's resources fails.
+	c.setBlockedURIs(nil)
 	raw, err := c.buildRawClient()
 	if err != nil {
 		return nil, err
@@ -956,41 +965,184 @@ func (c *Client) startPingTask(ctx context.Context) {
 }
 
 // toolFilterFunc builds the tool exposure predicate for one client.
-//
-// With no filter every tool is exposed. mode=allow exposes exactly the listed
-// tools (validation requires a non-empty list) and mode=block hides the listed
-// ones. An unrecognized mode cannot come from a validated config - it means
-// the OptionsV2 was built programmatically - so it fails closed, exposing
-// nothing, with a warning.
 func toolFilterFunc(name string, options *OptionsV2) func(string) bool {
-	if options == nil || options.ToolFilter == nil {
+	if options == nil {
 		return func(string) bool { return true }
 	}
-	filterSet := make(map[string]struct{}, len(options.ToolFilter.List))
-	for _, toolName := range options.ToolFilter.List {
-		filterSet[toolName] = struct{}{}
+	filter := catalogFilterFunc(name, "toolFilter", "tool", options.ToolFilter)
+	return func(toolName string) bool { return filter(toolName) }
+}
+
+// resourceFilterFunc builds the resource and resource-template exposure
+// predicate. It is called with every key an entry can be listed under (URI and
+// name for a resource, uriTemplate and name for a template).
+func resourceFilterFunc(name string, options *OptionsV2) func(...string) bool {
+	if options == nil {
+		return func(...string) bool { return true }
 	}
-	switch mode := ToolFilterMode(strings.ToLower(string(options.ToolFilter.Mode))); mode {
-	case ToolFilterModeAllow:
-		return func(toolName string) bool {
-			_, inList := filterSet[toolName]
+	return catalogFilterFunc(name, "resourceFilter", "resource", options.ResourceFilter)
+}
+
+// promptFilterFunc builds the prompt exposure predicate, keyed by prompt name.
+func promptFilterFunc(name string, options *OptionsV2) func(...string) bool {
+	if options == nil {
+		return func(...string) bool { return true }
+	}
+	return catalogFilterFunc(name, "promptFilter", "prompt", options.PromptFilter)
+}
+
+// catalogFilterFunc builds an allow/block predicate over one kind of catalog
+// entry. An entry passes in allow mode when any of its keys is listed, and is
+// hidden in block mode when any of its keys is listed. mode=allow with an
+// empty list is rejected by validation. An unrecognized mode cannot come from
+// a validated config - it means the OptionsV2 was built programmatically - so
+// it fails closed, exposing nothing, with a warning.
+func catalogFilterFunc(name, field, kind string, filter *FilterConfig) func(...string) bool {
+	if filter == nil {
+		return func(...string) bool { return true }
+	}
+	filterSet := make(map[string]struct{}, len(filter.List))
+	for _, entry := range filter.List {
+		filterSet[entry] = struct{}{}
+	}
+	listed := func(keys []string) bool {
+		for _, key := range keys {
+			if _, ok := filterSet[key]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	switch mode := FilterMode(strings.ToLower(string(filter.Mode))); mode {
+	case FilterModeAllow:
+		return func(keys ...string) bool {
+			inList := listed(keys)
 			if !inList {
-				slog.Debug("Ignoring tool not in allow list", "client", name, "tool", toolName)
+				slog.Debug("Ignoring "+kind+" not in allow list", "client", name, "keys", keys)
 			}
 			return inList
 		}
-	case ToolFilterModeBlock:
-		return func(toolName string) bool {
-			_, inList := filterSet[toolName]
+	case FilterModeBlock:
+		return func(keys ...string) bool {
+			inList := listed(keys)
 			if inList {
-				slog.Debug("Ignoring tool in block list", "client", name, "tool", toolName)
+				slog.Debug("Ignoring "+kind+" in block list", "client", name, "keys", keys)
 			}
 			return !inList
 		}
 	default:
-		slog.Warn("Unknown tool filter mode, hiding all tools", "client", name, "mode", mode)
-		return func(string) bool { return false }
+		slog.Warn("Unknown "+field+" mode, hiding all "+kind+"s", "client", name, "mode", mode)
+		return func(...string) bool { return false }
 	}
+}
+
+// resourceReadAllowed reports whether a concrete URI may be read. Listed
+// resources are filtered at registration, but mcp-go routes a read of a URI
+// that is not registered to the first resource template that matches it, so a
+// URI hidden by a block list could still be served through an exposed
+// template. In block mode the URI is therefore checked again here, against the
+// listed URIs and the URIs of resources that were hidden by name, after
+// normalization (see normalizeResourceURI). Allow mode needs no check: a read
+// can only reach a resource or template that was explicitly allowed.
+func (c *Client) resourceReadAllowed(uri string) bool {
+	c.blockedMu.RLock()
+	defer c.blockedMu.RUnlock()
+	if c.blockedURIs == nil {
+		return true
+	}
+	_, blocked := c.blockedURIs[normalizeResourceURI(uri)]
+	return !blocked
+}
+
+// setBlockedURIs records the normalized URIs a block-mode resourceFilter
+// hides: the listed entries plus hidden resources' URIs. It is a no-op without
+// a block-mode filter.
+func (c *Client) setBlockedURIs(hidden []string) {
+	if c.options == nil || c.options.ResourceFilter == nil ||
+		FilterMode(strings.ToLower(string(c.options.ResourceFilter.Mode))) != FilterModeBlock {
+		return
+	}
+	blocked := make(map[string]struct{}, len(c.options.ResourceFilter.List)+len(hidden))
+	for _, uri := range c.options.ResourceFilter.List {
+		blocked[normalizeResourceURI(uri)] = struct{}{}
+	}
+	for _, uri := range hidden {
+		blocked[normalizeResourceURI(uri)] = struct{}{}
+	}
+	c.blockedMu.Lock()
+	c.blockedURIs = blocked
+	c.blockedMu.Unlock()
+}
+
+// normalizeResourceURI gives equivalent spellings of a URI one form, so a
+// block list cannot be sidestepped by "test://echo/%73ecret" or
+// "TEST://Host/secret": the fragment is dropped, scheme and host are
+// lower-cased, percent-encoded unreserved characters are decoded and other
+// percent-encodings are upper-cased (RFC 3986 section 6.2.2). The path keeps
+// its case, since it is case-sensitive.
+func normalizeResourceURI(raw string) string {
+	// Decoding can form a new escape ("%7%30" becomes "%70"), so repeat until
+	// the form is stable. Each pass shortens the string or leaves it unchanged.
+	for {
+		normalized := normalizeResourceURIOnce(raw)
+		if normalized == raw {
+			return normalized
+		}
+		raw = normalized
+	}
+}
+
+func normalizeResourceURIOnce(raw string) string {
+	raw, _, _ = strings.Cut(raw, "#")
+	var b strings.Builder
+	b.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '%' && i+2 < len(raw) && isHexDigit(raw[i+1]) && isHexDigit(raw[i+2]) {
+			decoded := unhex(raw[i+1])<<4 | unhex(raw[i+2])
+			if isUnreserved(decoded) {
+				b.WriteByte(decoded)
+			} else {
+				b.WriteByte('%')
+				b.WriteString(strings.ToUpper(raw[i+1 : i+3]))
+			}
+			i += 2
+			continue
+		}
+		b.WriteByte(raw[i])
+	}
+	uri := b.String()
+	scheme, rest, ok := strings.Cut(uri, ":")
+	if !ok || scheme == "" || strings.ContainsAny(scheme, "/?") {
+		return uri
+	}
+	scheme = strings.ToLower(scheme)
+	if authority, ok := strings.CutPrefix(rest, "//"); ok {
+		end := strings.IndexAny(authority, "/?")
+		if end < 0 {
+			end = len(authority)
+		}
+		return scheme + "://" + strings.ToLower(authority[:end]) + authority[end:]
+	}
+	return scheme + ":" + rest
+}
+
+func isHexDigit(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case '0' <= c && c <= '9':
+		return c - '0'
+	case 'a' <= c && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
+	}
+}
+
+func isUnreserved(c byte) bool {
+	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '-' || c == '.' || c == '_' || c == '~'
 }
 
 func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServer) error {
@@ -1059,6 +1211,7 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 		return errors.New("downstream is not connected")
 	}
 	promptsRequest := mcp.ListPromptsRequest{}
+	filterFunc := promptFilterFunc(c.name, c.options)
 	// Collect and replace, so a prompt the downstream dropped is not left
 	// registered after a reconnect.
 	prompts := make([]server.ServerPrompt, 0)
@@ -1075,6 +1228,9 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 		}
 		slog.Debug("Successfully listed prompts", "client", c.name, "count", len(listed.Prompts))
 		for _, prompt := range listed.Prompts {
+			if !filterFunc(prompt.Name) {
+				continue
+			}
 			slog.Debug("Adding prompt", "client", c.name, "prompt", prompt.Name)
 			// Resolve the live client at call time so a reconnect is
 			// transparent to the handler. The per-request bound is applied here
@@ -1103,9 +1259,11 @@ func (c *Client) addResourcesToServer(ctx context.Context, mcpServer *server.MCP
 		return errors.New("downstream is not connected")
 	}
 	resourcesRequest := mcp.ListResourcesRequest{}
+	filterFunc := resourceFilterFunc(c.name, c.options)
 	// Collect and replace, so a resource the downstream dropped is not left
 	// registered after a reconnect.
 	resources := make([]server.ServerResource, 0)
+	var hidden []string
 	for {
 		listed, err := cl.ListResources(ctx, resourcesRequest)
 		if err != nil {
@@ -1119,6 +1277,10 @@ func (c *Client) addResourcesToServer(ctx context.Context, mcpServer *server.MCP
 		}
 		slog.Debug("Successfully listed resources", "client", c.name, "count", len(listed.Resources))
 		for _, resource := range listed.Resources {
+			if !filterFunc(resource.URI, resource.Name) {
+				hidden = append(hidden, resource.URI)
+				continue
+			}
 			slog.Debug("Adding resource", "client", c.name, "resource", resource.Name)
 			resources = append(resources, server.ServerResource{Resource: resource, Handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 				return c.readResource(ctx, request)
@@ -1130,6 +1292,7 @@ func (c *Client) addResourcesToServer(ctx context.Context, mcpServer *server.MCP
 		resourcesRequest.Params.Cursor = listed.NextCursor
 
 	}
+	c.setBlockedURIs(hidden)
 	mcpServer.SetResources(resources...)
 	return nil
 }
@@ -1140,6 +1303,7 @@ func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *se
 		return errors.New("downstream is not connected")
 	}
 	resourceTemplatesRequest := mcp.ListResourceTemplatesRequest{}
+	filterFunc := resourceFilterFunc(c.name, c.options)
 	// Collect and replace, so a template the downstream dropped is not left
 	// registered after a reconnect.
 	resourceTemplates := make([]server.ServerResourceTemplate, 0)
@@ -1162,6 +1326,9 @@ func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *se
 				slog.Warn("Skipping resource template without a uriTemplate", "client", c.name, "template", resourceTemplate.Name)
 				continue
 			}
+			if !filterFunc(resourceTemplate.URITemplate.Raw(), resourceTemplate.Name) {
+				continue
+			}
 			slog.Debug("Adding resource template", "client", c.name, "template", resourceTemplate.Name)
 			resourceTemplates = append(resourceTemplates, server.ServerResourceTemplate{Template: resourceTemplate, Handler: func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 				return c.readResource(ctx, request)
@@ -1181,6 +1348,9 @@ func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *se
 // per-request bound: an unanswered resource read occupies the single stdio
 // channel and takes the whole downstream unhealthy for every caller.
 func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	if !c.resourceReadAllowed(request.Params.URI) {
+		return nil, fmt.Errorf("resource %q is not available", request.Params.URI)
+	}
 	readResource, err := forward(ctx, c, func(ctx context.Context, cl *client.Client) (*mcp.ReadResourceResult, error) {
 		request.Params.Meta = stripHopMeta(request.Params.Meta)
 		return cl.ReadResource(ctx, request)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -203,12 +204,13 @@ type rawDownstream struct {
 
 	// Optional descriptor/metadata controls. Zero values preserve the original
 	// empty-catalog behaviour.
-	toolExecution     map[string]any   // attached to every listed tool when set
-	toolsRaw          json.RawMessage  // verbatim tools array; overrides tools when set
-	resourceTemplates []map[string]any // raw templates; []any{} when nil
-	prompts           []string         // prompt names; none when nil
-	resources         []string         // resource URIs; none when nil
-	hangMethods       map[string]bool  // methods that accept and never answer
+	toolExecution     map[string]any    // attached to every listed tool when set
+	toolsRaw          json.RawMessage   // verbatim tools array; overrides tools when set
+	resourceTemplates []map[string]any  // raw templates; []any{} when nil
+	prompts           []string          // prompt names; none when nil
+	resources         []string          // resource URIs; none when nil
+	resourceNames     map[string]string // resource URI -> name; the URI when unset
+	hangMethods       map[string]bool   // methods that accept and never answer
 
 	server *httptest.Server
 }
@@ -228,6 +230,9 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 		var req struct {
 			ID     json.RawMessage `json:"id"`
 			Method string          `json:"method"`
+			Params struct {
+				URI string `json:"uri"`
+			} `json:"params"`
 		}
 		if err := json.Unmarshal(body, &req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -302,12 +307,21 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 		case "resources/list":
 			d.mu.Lock()
 			uris := slices.Clone(d.resources)
+			names := maps.Clone(d.resourceNames)
 			d.mu.Unlock()
 			resources := make([]map[string]any, 0, len(uris))
 			for _, uri := range uris {
-				resources = append(resources, map[string]any{"uri": uri, "name": uri})
+				name := uri
+				if named, ok := names[uri]; ok {
+					name = named
+				}
+				resources = append(resources, map[string]any{"uri": uri, "name": name})
 			}
 			writeResult(map[string]any{"resources": resources})
+		case "resources/read":
+			// Echo the URI back, so a test can tell a forwarded read from one the
+			// proxy refused.
+			writeResult(map[string]any{"contents": []map[string]any{{"uri": req.Params.URI, "text": "read " + req.Params.URI}}})
 		case "resources/templates/list":
 			d.mu.Lock()
 			templates := d.resourceTemplates
@@ -357,6 +371,15 @@ func (d *rawDownstream) setResources(uris ...string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.resources = slices.Clone(uris)
+}
+
+func (d *rawDownstream) setResourceName(uri, name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.resourceNames == nil {
+		d.resourceNames = make(map[string]string)
+	}
+	d.resourceNames[uri] = name
 }
 
 func (d *rawDownstream) setToolExecution(execution map[string]any) {
@@ -728,13 +751,13 @@ func TestToolFilterFunc(t *testing.T) {
 	}{
 		{name: "nil options allows", options: nil, tool: "any", want: true},
 		{name: "nil filter allows", options: &OptionsV2{}, tool: "any", want: true},
-		{name: "allow list membership", options: &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterModeAllow, List: []string{"a"}}}, tool: "a", want: true},
-		{name: "allow list exclusion", options: &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterModeAllow, List: []string{"a"}}}, tool: "b", want: false},
-		{name: "empty block list allows", options: &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterModeBlock}}, tool: "any", want: true},
-		{name: "block list excludes", options: &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterModeBlock, List: []string{"b"}}}, tool: "b", want: false},
+		{name: "allow list membership", options: &OptionsV2{ToolFilter: &FilterConfig{Mode: FilterModeAllow, List: []string{"a"}}}, tool: "a", want: true},
+		{name: "allow list exclusion", options: &OptionsV2{ToolFilter: &FilterConfig{Mode: FilterModeAllow, List: []string{"a"}}}, tool: "b", want: false},
+		{name: "empty block list allows", options: &OptionsV2{ToolFilter: &FilterConfig{Mode: FilterModeBlock}}, tool: "any", want: true},
+		{name: "block list excludes", options: &OptionsV2{ToolFilter: &FilterConfig{Mode: FilterModeBlock, List: []string{"b"}}}, tool: "b", want: false},
 		// Validation rejects unknown modes, so this is only reachable with a
 		// programmatically built config; it fails closed.
-		{name: "unknown mode hides all", options: &OptionsV2{ToolFilter: &ToolFilterConfig{Mode: ToolFilterMode("nonsense")}}, tool: "any", want: false},
+		{name: "unknown mode hides all", options: &OptionsV2{ToolFilter: &FilterConfig{Mode: FilterMode("nonsense")}}, tool: "any", want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1685,5 +1708,315 @@ func TestStripHopMetaEnvelopeOnly(t *testing.T) {
 	progressOnly := &mcp.Meta{ProgressToken: "p1"}
 	if out := stripHopMeta(progressOnly); out != progressOnly {
 		t.Errorf("meta without additional fields = %#v, want it returned unchanged", out)
+	}
+}
+
+func TestCatalogFilterFuncSemantics(t *testing.T) {
+	t.Parallel()
+
+	allow := func(list ...string) *FilterConfig {
+		return &FilterConfig{Mode: FilterModeAllow, List: list}
+	}
+	block := func(list ...string) *FilterConfig {
+		return &FilterConfig{Mode: FilterModeBlock, List: list}
+	}
+	tests := []struct {
+		name   string
+		filter *FilterConfig
+		keys   []string
+		want   bool
+	}{
+		{name: "nil filter allows", filter: nil, keys: []string{"a"}, want: true},
+		// An empty allow list cannot come from a validated config; a
+		// programmatic one matches nothing and exposes nothing.
+		{name: "empty allow list exposes nothing", filter: allow(), keys: []string{"a"}, want: false},
+		{name: "allow matches first key", filter: allow("uri://a"), keys: []string{"uri://a", "a"}, want: true},
+		{name: "allow matches second key", filter: allow("a"), keys: []string{"uri://a", "a"}, want: true},
+		{name: "allow excludes unlisted", filter: allow("b"), keys: []string{"uri://a", "a"}, want: false},
+		{name: "empty block list allows", filter: block(), keys: []string{"a"}, want: true},
+		{name: "block hides by any key", filter: block("a"), keys: []string{"uri://a", "a"}, want: false},
+		{name: "block keeps unlisted", filter: block("b"), keys: []string{"uri://a", "a"}, want: true},
+		{name: "mode is case-insensitive", filter: &FilterConfig{Mode: "BLOCK", List: []string{"a"}}, keys: []string{"a"}, want: false},
+		{name: "unknown mode fails closed", filter: &FilterConfig{Mode: "nonsense", List: []string{"a"}}, keys: []string{"b"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resourceFilterFunc("test", &OptionsV2{ResourceFilter: tt.filter})(tt.keys...)
+			if got != tt.want {
+				t.Errorf("resourceFilter = %v, want %v", got, tt.want)
+			}
+			got = promptFilterFunc("test", &OptionsV2{PromptFilter: tt.filter})(tt.keys...)
+			if got != tt.want {
+				t.Errorf("promptFilter = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestToolFilterIgnoresResourceAndPromptFilters(t *testing.T) {
+	t.Parallel()
+
+	options := &OptionsV2{
+		ResourceFilter: &FilterConfig{Mode: FilterModeAllow},
+		PromptFilter:   &FilterConfig{Mode: FilterModeAllow},
+	}
+	if !toolFilterFunc("test", options)("any") {
+		t.Fatal("resourceFilter/promptFilter must not affect tools")
+	}
+	if !resourceFilterFunc("test", &OptionsV2{ToolFilter: &FilterConfig{Mode: FilterModeAllow, List: []string{"x"}}})("any") {
+		t.Fatal("toolFilter must not affect resources")
+	}
+}
+
+func TestResourceAndPromptFiltersApplyToCatalog(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	downstream.setPrompts("greet", "internal")
+	downstream.setResources("test://public", "test://secret")
+	downstream.setResourceTemplates(
+		map[string]any{"name": "echo", "uriTemplate": "test://echo/{word}"},
+		map[string]any{"name": "dump", "uriTemplate": "test://dump/{id}"},
+	)
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options: &OptionsV2{
+			ResourceFilter: &FilterConfig{Mode: FilterModeBlock, List: []string{"test://secret", "dump"}},
+			PromptFilter:   &FilterConfig{Mode: FilterModeAllow, List: []string{"greet"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+
+	if got := serverListNames(t, proxyServer, "resources/list", "resources", "uri"); !slices.Equal(got, []string{"test://public"}) {
+		t.Errorf("resources = %v, want [test://public]", got)
+	}
+	if got := serverResourceTemplateNames(t, proxyServer); !slices.Equal(got, []string{"echo"}) {
+		t.Errorf("resource templates = %v, want [echo]", got)
+	}
+	if got := serverListNames(t, proxyServer, "prompts/list", "prompts", "name"); !slices.Equal(got, []string{"greet"}) {
+		t.Errorf("prompts = %v, want [greet]", got)
+	}
+}
+
+// A URI hidden by a block list must not be readable through an exposed
+// template that happens to match it, whatever way it is spelled.
+func TestBlockedResourceIsNotReadableThroughTemplate(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	downstream.setResources("test://echo/secret", "test://echo/hidden")
+	downstream.setResourceName("test://echo/hidden", "hidden-doc")
+	downstream.setResourceTemplates(
+		map[string]any{"name": "echo", "uriTemplate": "test://echo/{word}"},
+		map[string]any{"name": "dump", "uriTemplate": "test://dump/{id}"},
+	)
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options: &OptionsV2{
+			ResourceFilter: &FilterConfig{Mode: FilterModeBlock, List: []string{"test://echo/secret", "hidden-doc", "test://dump/{id}"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	if got := serverResourceTemplateNames(t, proxyServer); !slices.Equal(got, []string{"echo"}) {
+		t.Fatalf("templates = %v, want [echo] (dump blocked by uriTemplate)", got)
+	}
+
+	// Each spelling must fail. Some are refused by the proxy's check, others
+	// never match the template in mcp-go; either way none may be served.
+	for _, uri := range []string{
+		"test://echo/secret",
+		"test://echo/%73ecret",
+		"test://echo/secret#frag",
+		"TEST://ECHO/secret",
+		"test://echo/hidden", // hidden by name, not by URI
+	} {
+		if msg := readResourceError(t, proxyServer, uri); msg == "" {
+			t.Errorf("read %q was served", uri)
+		}
+	}
+	for _, uri := range []string{"test://echo/secret", "test://echo/%73ecret", "test://echo/hidden"} {
+		if msg := readResourceError(t, proxyServer, uri); !strings.Contains(msg, "not available") {
+			t.Errorf("read %q: error = %q, want the proxy's refusal", uri, msg)
+		}
+	}
+	if msg := readResourceError(t, proxyServer, "test://echo/other"); msg != "" {
+		t.Errorf("read of an unblocked URI failed: %q", msg)
+	}
+}
+
+func TestNormalizeResourceURI(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"test://echo/secret":      "test://echo/secret",
+		"TEST://Echo/Secret":      "test://echo/Secret",
+		"test://echo/%73ecret":    "test://echo/secret",
+		"test://echo/a%2fb":       "test://echo/a%2Fb",
+		"test://echo/x#fragment":  "test://echo/x",
+		"file:///etc/%70asswd":    "file:///etc/passwd",
+		"urn:Example:%7Eitem":     "urn:Example:~item",
+		"no-scheme/path%41":       "no-scheme/pathA",
+		"test://h?q=%41#f":        "test://h?q=A",
+		"test://echo/bad%zzvalue": "test://echo/bad%zzvalue",
+		"test://echo/%7%30ass":    "test://echo/pass",
+	}
+	for in, want := range tests {
+		if got := normalizeResourceURI(in); got != want {
+			t.Errorf("normalizeResourceURI(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Allow mode exposes a template by name, and with it every URI it matches.
+func TestAllowedTemplateByName(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	downstream.setResourceTemplates(
+		map[string]any{"name": "echo", "uriTemplate": "test://echo/{word}"},
+		map[string]any{"name": "dump", "uriTemplate": "test://dump/{id}"},
+	)
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options:       &OptionsV2{ResourceFilter: &FilterConfig{Mode: FilterModeAllow, List: []string{"echo"}}},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	if got := serverResourceTemplateNames(t, proxyServer); !slices.Equal(got, []string{"echo"}) {
+		t.Fatalf("templates = %v, want [echo]", got)
+	}
+	if msg := readResourceError(t, proxyServer, "test://echo/anything"); msg != "" {
+		t.Errorf("read through the allowed template failed: %q", msg)
+	}
+	if msg := readResourceError(t, proxyServer, "test://dump/1"); msg == "" {
+		t.Error("read through a template that is not allowed succeeded")
+	}
+}
+
+// serverListNames reads back one field of every entry a list method returns.
+func serverListNames(t *testing.T, mcpServer *server.MCPServer, method, resultKey, field string) []string {
+	t.Helper()
+
+	resp := mcpServer.HandleMessage(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"`+method+`","params":{}}`))
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal %s response: %v", method, err)
+	}
+	var decoded struct {
+		Result map[string][]map[string]any `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal %s response: %v (%s)", method, err, raw)
+	}
+	names := make([]string, 0)
+	for _, entry := range decoded.Result[resultKey] {
+		if value, ok := entry[field].(string); ok {
+			names = append(names, value)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// readResourceError performs resources/read on the proxy-side server and
+// returns the JSON-RPC error message, or "" on success.
+func readResourceError(t *testing.T, mcpServer *server.MCPServer, uri string) string {
+	t.Helper()
+
+	request, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "resources/read",
+		"params": map[string]any{"uri": uri},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	raw, err := json.Marshal(mcpServer.HandleMessage(context.Background(), request))
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	var decoded struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if decoded.Error == nil {
+		return ""
+	}
+	return decoded.Error.Message
+}
+
+// An empty allow list cannot come from a validated config; a programmatic one
+// matches nothing, so resources, templates and prompts are all hidden while
+// tools (which have no filter here) still show.
+func TestEmptyAllowListHidesAllResourcesAndPrompts(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	downstream.setPrompts("greet")
+	downstream.setResources("test://public")
+	downstream.setResourceTemplates(map[string]any{"name": "echo", "uriTemplate": "test://echo/{word}"})
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options: &OptionsV2{
+			ResourceFilter: &FilterConfig{Mode: FilterModeAllow},
+			PromptFilter:   &FilterConfig{Mode: FilterModeAllow},
+		},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	if got := serverListNames(t, proxyServer, "resources/list", "resources", "uri"); len(got) != 0 {
+		t.Errorf("resources = %v, want none", got)
+	}
+	if got := serverResourceTemplateNames(t, proxyServer); len(got) != 0 {
+		t.Errorf("resource templates = %v, want none", got)
+	}
+	if got := serverListNames(t, proxyServer, "prompts/list", "prompts", "name"); len(got) != 0 {
+		t.Errorf("prompts = %v, want none", got)
+	}
+	if got := serverToolNames(t, proxyServer); !slices.Equal(got, []string{"alpha"}) {
+		t.Errorf("tools = %v, want [alpha]", got)
 	}
 }

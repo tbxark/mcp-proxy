@@ -30,6 +30,15 @@ This project uses the JSON configuration below.
         "toolFilter": {
           "mode": "block",
           "list": ["create_or_update_file"]
+        },
+        "resourceFilter": {
+          "mode": "allow",
+          // a template and a concrete resource; every other resource is hidden
+          "list": ["repo://{owner}/{repo}/contents{/path*}", "repo://README"]
+        },
+        "promptFilter": {
+          "mode": "block",
+          "list": ["issue_triage"]
         }
       }
     },
@@ -165,8 +174,22 @@ looking, from the logs, like a refresh failure with no obvious cause.
   - `mode`: `allow` or `block`.
   - `list`: List of tool names.
   - `mode: "allow"` exposes only the listed tools and requires a non-empty `list`.
-    `mode: "block"` hides the listed tools. The filter applies to tools only — a
-    downstream's resources and prompts are always exposed.
+    `mode: "block"` hides the listed tools. The filter applies to tools only;
+    use `resourceFilter` and `promptFilter` for the rest of the catalog.
+- `resourceFilter` (object): Selectively expose resources and resource templates.
+  Same shape as `toolFilter` (`mode` and `list`). A list entry matches a resource by
+  its `uri` or `name`, and a resource template by its `uriTemplate` or `name`.
+  In `block` mode a read is also refused when it targets a hidden resource (listed by
+  URI, or hidden by name once the resource list has been fetched) through an exposed
+  template that matches it. Blocking a template hides only that template: a URI it
+  would produce stays readable through another exposed template that matches it. The check
+  compares normalized URIs (fragment dropped, scheme and host lower-cased,
+  percent-encoded unreserved characters decoded), but a downstream that maps other
+  spellings to the same resource can still serve it; use `allow` mode when the filter
+  is a security boundary. In `allow` mode, allowing a template allows every URI it
+  matches, including resources that are not allowed individually.
+- `promptFilter` (object): Selectively expose prompts by name. Same shape as
+  `toolFilter`.
 - `disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
 - `autoReconnect` (bool, default `false`): Keep a downstream connection alive across
   failures. When true, a server that is unreachable at startup is retried every
@@ -194,9 +217,12 @@ looking, from the logs, like a refresh failure with no obvious cause.
 Notes:
 
 - `mcpProxy.options.authTokens` serves as the default token set if a server omits `options.authTokens`.
-- `mcpProxy.options.toolFilter` likewise serves as the default filter if a server omits
-  `options.toolFilter`. The other `mcpProxy.options` values (`panicIfInvalid`, `logEnabled`,
+- `mcpProxy.options.toolFilter`, `resourceFilter` and `promptFilter` likewise serve as the
+  default filters if a server omits them; a per-server filter replaces the inherited one
+  entirely. The other `mcpProxy.options` values (`panicIfInvalid`, `logEnabled`,
   `pingInterval`, `autoReconnect`, `reconnectInterval`) are defaults for servers that omit
   them, so a fleet-wide setting can be declared once. `disabled` is per-server only;
   setting it on `mcpProxy.options` is rejected.
-- To discover tool names for filtering, start without a filter and check logs for lines like `<server> Adding tool <name>`.
+- To discover tool names for filtering, start without a filter and check logs for lines
+  like `<server> Adding tool <name>`. Resources, templates and prompts are logged the
+  same way (`Adding resource`, `Adding resource template`, `Adding prompt`) at debug level.
