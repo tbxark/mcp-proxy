@@ -255,7 +255,10 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 		c.forget(raw)
 		return oauthAwareError(c.name, err)
 	}
-	forwardInstructions(mcpServer, initResult)
+	// First connect only: later, server.WithInstructions races handleInitialize.
+	if !c.hasConnected {
+		forwardInstructions(mcpServer, initResult)
+	}
 
 	c.mu.Lock()
 	old := c.client
