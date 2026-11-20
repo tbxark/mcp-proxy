@@ -48,11 +48,8 @@ func TestParseMCPClientConfigV2(t *testing.T) {
 		{name: "stdio missing command", config: &MCPClientConfigV2{TransportType: MCPClientTypeStdio}, wantErr: "command is required"},
 		{name: "oauth on stdio", config: &MCPClientConfigV2{Command: "server", OAuth: &OAuthClientConfig{}}, wantErr: "oauth is not supported"},
 		{name: "negative timeout", config: &MCPClientConfigV2{TransportType: MCPClientTypeStreamable, URL: "https://example.com", Timeout: -1}, wantErr: "timeout cannot be negative"},
-		// A stray sub-millisecond timeout copied in from a Claude config (where
-		// a bare number means nanoseconds) is discarded rather than failing the
-		// whole proxy's startup. A usable one is kept and bounds each request.
-		{name: "stdio ignores unusable timeout", config: &MCPClientConfigV2{Command: "server", Timeout: 30}, want: &StdioMCPClientConfig{}},
-		{name: "stdio keeps usable timeout", config: &MCPClientConfigV2{Command: "server", Timeout: Duration(30 * time.Second)}, want: &StdioMCPClientConfig{Timeout: Duration(30 * time.Second)}},
+		{name: "negative stdio timeout", config: &MCPClientConfigV2{Command: "server", Timeout: -1}, wantErr: "timeout cannot be negative"},
+		{name: "stdio keeps timeout", config: &MCPClientConfigV2{Command: "server", Timeout: Duration(30 * time.Second)}, want: &StdioMCPClientConfig{Timeout: Duration(30 * time.Second)}},
 	}
 
 	for _, tt := range tests {
@@ -254,11 +251,11 @@ func TestDurationUnmarshal(t *testing.T) {
 	}{
 		{name: "duration string", json: `"30s"`, want: 30 * time.Second},
 		{name: "minutes", json: `"1m30s"`, want: 90 * time.Second},
-		{name: "bare number is nanoseconds", json: `30000000000`, want: 30 * time.Second},
-		{name: "zero", json: `0`, want: 0},
-		// Decoding null into a plain time.Duration was always a no-op, so it
-		// still has to mean "unset" rather than fail the whole config.
 		{name: "null is unset", json: `null`, want: 0},
+		// A bare number reads as seconds to most people but decodes as
+		// nanoseconds, so it is rejected rather than silently misapplied.
+		{name: "bare number rejected", json: `30000000000`, wantErr: true},
+		{name: "zero number rejected", json: `0`, wantErr: true},
 		{name: "bad string", json: `"soon"`, wantErr: true},
 		{name: "bad type", json: `true`, wantErr: true},
 	}
@@ -282,15 +279,9 @@ func TestDurationUnmarshal(t *testing.T) {
 	}
 }
 
-// A bare 30 decodes to 30 nanoseconds, which silently broke every request to
-// that server. It has to be rejected with a message about the unit.
-func TestValidateDurationRejectsNanosecondMistake(t *testing.T) {
+func TestValidateDuration(t *testing.T) {
 	t.Parallel()
 
-	err := validateDuration("timeout", 30)
-	if err == nil || !strings.Contains(err.Error(), `"30s"`) || !strings.Contains(err.Error(), "timeout") {
-		t.Fatalf("validateDuration(30ns) = %v, want an error naming the field and suggesting a duration string", err)
-	}
 	if err := validateDuration("timeout", -1); err == nil {
 		t.Fatal("validateDuration(-1) = nil, want an error")
 	}

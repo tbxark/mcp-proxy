@@ -21,11 +21,9 @@ import (
 	"github.com/tbxark/optional-go"
 )
 
-// Duration is a time.Duration that also accepts a JSON string like "30s". A
-// bare JSON number still means nanoseconds, which is what decoding into a
-// time.Duration has always done here, but that reads as seconds to almost
-// everyone - so validation rejects the sub-millisecond values that mistake
-// produces.
+// Duration is a time.Duration decoded from a JSON string like "30s". A bare
+// JSON number is rejected rather than read as nanoseconds: it reads as seconds
+// to almost everyone, and a bare 30 used to silently become 30 nanoseconds.
 type Duration time.Duration
 
 func (d *Duration) UnmarshalJSON(data []byte) error {
@@ -40,14 +38,10 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("invalid duration %q: %w", v, err)
 		}
 		*d = Duration(parsed)
-	case float64:
-		*d = Duration(v)
 	case nil:
 		// An explicit null means "unset", exactly like leaving the key out.
-		// Decoding into a plain time.Duration used to ignore it, so failing
-		// here would reject configs that have always loaded.
 	default:
-		return fmt.Errorf(`duration must be a string like "30s" or a number of nanoseconds, got %s`, data)
+		return fmt.Errorf(`duration must be a string like "30s", got %s`, data)
 	}
 	return nil
 }
@@ -270,19 +264,14 @@ func parseMCPClientConfigV2(conf *MCPClientConfigV2) (any, error) {
 		if conf.OAuth != nil {
 			return nil, errors.New("oauth is not supported for stdio transport")
 		}
-		// A sub-millisecond timeout is almost always a bare number copied in
-		// from a Claude config, where it means nanoseconds. Such a value is
-		// discarded rather than failing startup — the historical behaviour for
-		// stdio — but a usable one now bounds each request.
-		stdioTimeout := conf.Timeout
-		if err := validateDuration("timeout", stdioTimeout); err != nil {
-			stdioTimeout = 0
+		if err := validateDuration("timeout", conf.Timeout); err != nil {
+			return nil, err
 		}
 		return &StdioMCPClientConfig{
 			Command: conf.Command,
 			Env:     conf.Env,
 			Args:    conf.Args,
-			Timeout: stdioTimeout,
+			Timeout: conf.Timeout,
 		}, nil
 	case MCPClientTypeSSE:
 		if conf.URL == "" {
@@ -315,15 +304,10 @@ func parseMCPClientConfigV2(conf *MCPClientConfigV2) (any, error) {
 	}
 }
 
-// validateDuration rejects the values a bare JSON number produces when the
-// author meant seconds: 30 decodes to 30 nanoseconds, which used to fail every
-// request with an unhelpful deadline error.
+// validateDuration rejects negative durations; everything else is valid.
 func validateDuration(field string, d Duration) error {
 	if d < 0 {
 		return fmt.Errorf("%s cannot be negative", field)
-	}
-	if d > 0 && time.Duration(d) < time.Millisecond {
-		return fmt.Errorf(`%s %v is shorter than a millisecond; a bare number means nanoseconds, write a string like "30s" instead`, field, time.Duration(d))
 	}
 	return nil
 }

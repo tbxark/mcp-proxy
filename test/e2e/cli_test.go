@@ -67,9 +67,9 @@ func TestProxyCLI(t *testing.T) {
 		}
 	})
 
-	// A bare number means nanoseconds, so "timeout": 30 used to silently break
-	// every request to that server.
-	t.Run("check-config rejects a nanosecond timeout", func(t *testing.T) {
+	// A bare number reads as seconds to most people, so durations are strings
+	// only and a number is rejected.
+	t.Run("check-config rejects a numeric timeout", func(t *testing.T) {
 		t.Parallel()
 
 		bad := writeConfig(t, `{
@@ -86,10 +86,10 @@ func TestProxyCLI(t *testing.T) {
 }`)
 		_, stderr, err := runCLI(t, "-check-config", "-config", bad)
 		if err == nil {
-			t.Fatal("-check-config accepted a 30ns timeout")
+			t.Fatal("-check-config accepted a numeric timeout")
 		}
-		if !strings.Contains(stderr, "nanoseconds") || !strings.Contains(stderr, "30s") {
-			t.Errorf("stderr = %q, want a hint about the unit and a duration string", stderr)
+		if !strings.Contains(stderr, "duration must be a string like") {
+			t.Errorf("stderr = %q, want the duration-string error", stderr)
 		}
 	})
 
