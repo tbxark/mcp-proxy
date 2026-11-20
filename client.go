@@ -68,11 +68,10 @@ type Client struct {
 	// life is cancelled by Close. Everything the client runs in the
 	// background (the keepalive/reconnect loop, the long-lived Start context of
 	// a transport) is bound to it as well as to the caller's context, because
-	// the caller's context can outlive the client: a server stopped by a
-	// reload is closed while the proxy - and the context its boot-time
-	// supervisor was given - keeps running. Without this the keepalive loop of
-	// a closed client probes a dead transport and retries "client is closed"
-	// forever.
+	// the caller's context can outlive the client: Close can run while it is
+	// still alive, e.g. when shutdown races a connect or in tests. Without
+	// this the keepalive loop of a closed client probes a dead transport and
+	// retries "client is closed" forever.
 	life     context.Context
 	stopLife context.CancelFunc
 
@@ -174,7 +173,13 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 // backend (closed Obsidian, crashed stdio server) is replaced rather than
 // reused.
 func (c *Client) buildRawClient() (*client.Client, error) {
-	switch v := c.clientConf.(type) {
+	return newRawClient(c.name, c.clientConf)
+}
+
+// newRawClient builds an mcp-go client for one parsed transport config. It is
+// shared by Client (connect and reconnect) and the one-off -authorize flow.
+func newRawClient(name string, conf any) (*client.Client, error) {
+	switch v := conf.(type) {
 	case *StdioMCPClientConfig:
 		envs := make([]string, 0, len(v.Env))
 		for kk, vv := range v.Env {
@@ -184,12 +189,12 @@ func (c *Client) buildRawClient() (*client.Client, error) {
 		if err != nil {
 			return nil, err
 		}
-		drainStderr(c.name, raw)
+		drainStderr(name, raw)
 		return raw, nil
 	case *SSEMCPClientConfig:
 		options := sseClientOptions(v)
 		if v.OAuth != nil {
-			oc, err := buildOAuthConfig(c.name, v.OAuth)
+			oc, err := buildOAuthConfig(name, v.OAuth)
 			if err != nil {
 				return nil, err
 			}
@@ -199,7 +204,7 @@ func (c *Client) buildRawClient() (*client.Client, error) {
 	case *StreamableMCPClientConfig:
 		options := streamableClientOptions(v)
 		if v.OAuth != nil {
-			oc, err := buildOAuthConfig(c.name, v.OAuth)
+			oc, err := buildOAuthConfig(name, v.OAuth)
 			if err != nil {
 				return nil, err
 			}
@@ -421,7 +426,8 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 }
 
 // reconnect rebuilds a dropped downstream using the details remembered at
-// first connect. It is only called from the ping task.
+// first connect. It runs from the ping task and, via recoverSession, from a
+// forwarded request that found its session lost.
 func (c *Client) reconnect(ctx context.Context) error {
 	return c.connect(ctx, c.clientInfo, c.mcpServer)
 }

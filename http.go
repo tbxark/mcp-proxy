@@ -40,7 +40,7 @@ const bearerPrefix = "Bearer "
 
 // bearerToken extracts the credentials from an Authorization header. RFC 7235
 // makes the scheme name case-insensitive, so "bearer" is as valid as "Bearer".
-// A bare token with no scheme is also accepted, which earlier versions allowed.
+// A bare token with no scheme is also accepted.
 func bearerToken(header string) string {
 	header = strings.TrimSpace(header)
 	if len(header) >= len(bearerPrefix) && strings.EqualFold(header[:len(bearerPrefix)], bearerPrefix) {

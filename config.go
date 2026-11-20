@@ -315,11 +315,11 @@ func validateDuration(field string, d Duration) error {
 func validateHTTPURL(field, rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		// Keep the original "is invalid" wording for compatibility, but do not
-		// echo the URL or the parser's reason. net/url truncates a malformed URL
-		// at the first '#', after which a credential can look like a port
-		// ("https://user:SECRET#frag@h/p" yields `invalid port ":SECRET"`), so
-		// neither the URL nor the reason can be redacted reliably.
+		// Do not echo the URL or the parser's reason. net/url truncates a
+		// malformed URL at the first '#', after which a credential can look
+		// like a port ("https://user:SECRET#frag@h/p" yields `invalid port
+		// ":SECRET"`), so neither the URL nor the reason can be redacted
+		// reliably.
 		return fmt.Errorf("%s is invalid: the value is not a parseable URL", field)
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {

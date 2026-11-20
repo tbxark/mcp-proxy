@@ -82,7 +82,6 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 	}
 
 	var oauthConf *OAuthClientConfig
-	var mcpClient *client.Client
 	switch v := clientInfo.(type) {
 	case *StdioMCPClientConfig:
 		return fmt.Errorf("server %q is a stdio server, OAuth authorization does not apply", serverName)
@@ -91,24 +90,15 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 			return fmt.Errorf("server %q has no oauth config; add mcpServers.%s.oauth to config.json first", serverName, serverName)
 		}
 		oauthConf = v.OAuth
-		oc, bErr := buildOAuthConfig(serverName, oauthConf)
-		if bErr != nil {
-			return bErr
-		}
-		mcpClient, err = client.NewOAuthSSEClient(v.URL, oc, sseClientOptions(v)...)
 	case *StreamableMCPClientConfig:
 		if v.OAuth == nil {
 			return fmt.Errorf("server %q has no oauth config; add mcpServers.%s.oauth to config.json first", serverName, serverName)
 		}
 		oauthConf = v.OAuth
-		oc, bErr := buildOAuthConfig(serverName, oauthConf)
-		if bErr != nil {
-			return bErr
-		}
-		mcpClient, err = client.NewOAuthStreamableHttpClient(v.URL, oc, streamableClientOptions(v)...)
 	default:
 		return errors.New("invalid client type")
 	}
+	mcpClient, err := newRawClient(serverName, clientInfo)
 	if err != nil {
 		return fmt.Errorf("failed to create client: %w", err)
 	}
