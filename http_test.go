@@ -267,8 +267,7 @@ func TestFatalStartupErrorIsRedacted(t *testing.T) {
 	if strings.Contains(fatal.Error(), "FATAL_SECRET") {
 		t.Fatalf("the fatal startup error still carries the credential: %s", fatal)
 	}
-	var asURLErr *url.Error
-	if !errors.As(fatal, &asURLErr) {
+	if _, ok := errors.AsType[*url.Error](fatal); !ok {
 		t.Error("redaction must preserve the url.Error in the chain")
 	}
 

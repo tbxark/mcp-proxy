@@ -1060,8 +1060,7 @@ func TestRedactURLCredentialsHandlesQuotedSecret(t *testing.T) {
 			t.Errorf("secret %q survived redaction: %s", secret, got)
 		}
 		// The failure-classification chain must survive too.
-		var asURLErr *url.Error
-		if !errors.As(redactURLCredentials(urlErr), &asURLErr) {
+		if _, ok := errors.AsType[*url.Error](redactURLCredentials(urlErr)); !ok {
 			t.Errorf("errors.As(*url.Error) failed after redaction of %q", secret)
 		}
 	}
@@ -1142,8 +1141,7 @@ func TestRedactURLCredentialsDropsContaminatedReason(t *testing.T) {
 		t.Fatalf("expected the URL to be replaced with the placeholder: %s", message)
 	}
 	// The parse error must still be reachable for callers that inspect it.
-	var asURLErr *url.Error
-	if !errors.As(redactURLCredentials(urlErr), &asURLErr) {
+	if _, ok := errors.AsType[*url.Error](redactURLCredentials(urlErr)); !ok {
 		t.Error("errors.As(*url.Error) must still succeed")
 	}
 }

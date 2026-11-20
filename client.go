@@ -1548,8 +1548,7 @@ func (c *Client) Close() error {
 	// stdin is closed (many MCP servers do), is not a failure to close it.
 	// Reporting it as one would make the proxy exit non-zero after an
 	// otherwise clean shutdown.
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if _, ok := errors.AsType[*exec.ExitError](err); ok {
 		slog.Warn("Downstream server exited with an error", "client", c.name, "err", err)
 		return nil
 	}
