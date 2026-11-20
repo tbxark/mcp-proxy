@@ -1,22 +1,6 @@
 # Configuration
 
-This project uses the v2 JSON configuration below. The v1 schema (top-level
-`server` and `clients` keys) has been removed: rename them to `mcpProxy` and
-`mcpServers`, and lift each client's `config` object into the server entry
-itself, so that
-
-```jsonc
-{"clients": {"fetch": {"type": "stdio", "config": {"command": "uvx", "args": ["mcp-server-fetch"]}}}}
-```
-
-becomes
-
-```jsonc
-{"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}}
-```
-
-`panicIfInvalid`, `logEnabled` and `authTokens` move into the entry's `options`,
-and the proxy's `globalAuthTokens` become `mcpProxy.options.authTokens`.
+This project uses the JSON configuration below.
 
 - Online converter (build Claude config from your proxy): https://tbxark.github.io/mcp-proxy
 
@@ -61,12 +45,8 @@ and the proxy's `globalAuthTokens` become `mcpProxy.options.authTokens`.
       }
     },
     "amap": {
-      // SSE client
-      "url": "https://mcp.amap.com/sse",
-      "headers": { "Authorization": "Bearer <YOUR_TOKEN>" },
-      "options": {
-        "disabled": true
-      }
+      // SSE client with the token in the URL query (amap only accepts a key this way)
+      "url": "https://mcp.amap.com/sse?key=<YOUR_TOKEN>"
     },
     "notion": {
       // streamable-http client requiring interactive OAuth (no static
@@ -116,11 +96,9 @@ Common fields:
   credentials from the error messages and logs it controls, but a preference for
   headers avoids relying on that and keeps tokens out of access logs.
 - `timeout` — request timeout for a single downstream request. Write it as a
-  duration string: `"timeout": "30s"`. A bare number means **nanoseconds**
-  (`"timeout": 30` is 30ns, not 30 seconds), so anything under a millisecond is
-  rejected at startup rather than silently failing every request — except on
-  `stdio`, where such a value is discarded and the server runs unbounded, so a
-  timeout copied in from a Claude config cannot break startup.
+  duration string: `"timeout": "30s"`. A bare number is rejected — the same
+  rule applies on `stdio` — because it reads as seconds to most people while
+  decoding as nanoseconds.
   On `stdio` a timeout is worth setting: one pipe carries every request, so a
   request the server accepts and never answers keeps that pipe busy, the
   keepalive probe stops getting replies, and the whole downstream is dropped as
@@ -172,8 +150,6 @@ process, so without persisting it, a freshly started daemon would build a
 new OAuth handler with an empty client ID and every token refresh would
 silently be rejected by the provider once the access token expires -
 looking, from the logs, like a refresh failure with no obvious cause.
-(Releases before this used `<server>.client.json`; that name is still read as a
-fallback, so an existing registration keeps working.)
 
 ## options
 
@@ -182,15 +158,15 @@ fallback, so an existing registration keeps working.)
   to keep it alive and to notice it died. This is how quickly `/_readyz` turns
   `degraded` after a downstream goes away.
 - `logEnabled` (bool): Log requests and events for this client.
-- `authTokens` ([]string): Valid bearer tokens; requests must include `Authorization: <token>`.
+- `authTokens` ([]string): Valid bearer tokens; requests must include
+  `Authorization: Bearer <token>` (a bare token is also accepted).
 - `toolFilter` (object): Selectively expose tools to the proxy:
   - `mode`: `allow` or `block`.
   - `list`: List of tool names.
-  - `mode: "allow"` exposes only the listed tools, so an empty (or omitted) `list`
-    exposes **no** tools. `mode: "block"` hides the listed tools, so an empty list
-    hides nothing. The filter applies to tools only — a downstream's resources and
-    prompts are always exposed.
-- `Disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
+  - `mode: "allow"` exposes only the listed tools and requires a non-empty `list`.
+    `mode: "block"` hides the listed tools. The filter applies to tools only — a
+    downstream's resources and prompts are always exposed.
+- `disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
 - `autoReconnect` (bool, default `false`): Keep a downstream connection alive across
   failures. When true, a server that is unreachable at startup is retried every
   `reconnectInterval` until it connects (its route is mounted then), and a connection
@@ -220,6 +196,6 @@ Notes:
 - `mcpProxy.options.toolFilter` likewise serves as the default filter if a server omits
   `options.toolFilter`. The other `mcpProxy.options` values (`panicIfInvalid`, `logEnabled`,
   `pingInterval`, `autoReconnect`, `reconnectInterval`) are defaults for servers that omit
-  them, so a fleet-wide setting can be declared once. `disabled` is per-server only and is
-  not inherited.
+  them, so a fleet-wide setting can be declared once. `disabled` is per-server only;
+  setting it on `mcpProxy.options` is rejected.
 - To discover tool names for filtering, start without a filter and check logs for lines like `<server> Adding tool <name>`.

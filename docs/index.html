@@ -227,6 +227,9 @@
         const suffix = fromConfig?.mcpProxy?.type === 'streamable-http' ? 'mcp' : 'sse';
         const servers = [];
         for (const key of Object.keys(mcpServers)) {
+            if (mcpServers[key]?.options?.disabled === true) {
+                continue;
+            }
             const url = new URL(baseUrlObj);
             url.pathname = `${url.pathname.replace(/\/+$/, '')}/${key}/${suffix}`.replace(/\/+/g, '/');
             const token = mcpServers[key]?.options?.authTokens?.[0] ?? options?.authTokens?.[0];
@@ -246,7 +249,7 @@
             };
             if (server.token) {
                 target.headers = {
-                    Authorization: server.token
+                    Authorization: `Bearer ${server.token}`
                 };
             }
             config.mcpServers[server.key] = target;
@@ -262,7 +265,7 @@
             if (server.token) {
                 lines.push('');
                 lines.push(`[mcp_servers.${tomlKey(server.key)}.http_headers]`);
-                lines.push(`Authorization = ${tomlString(server.token)}`);
+                lines.push(`Authorization = ${tomlString(`Bearer ${server.token}`)}`);
             }
             lines.push('');
         }

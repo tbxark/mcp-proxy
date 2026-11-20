@@ -64,6 +64,6 @@ services:
 ## Security Notes
 
 - Prefer `authTokens` per downstream server; only use the `mcpProxy` default when appropriate.
-- If a downstream server cannot set headers, you can embed a token in the route key (e.g. `fetch/<token>`) and route via that path.
+- If an MCP client cannot set headers, you can embed a token in the route key (e.g. `fetch/<token>`) and route via that path.
 - Set `options.panicIfInvalid: true` for critical servers to fail fast on misconfiguration.
 

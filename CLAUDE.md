@@ -25,7 +25,7 @@ make format                     # full pipeline: go fix/fmt/vet, tests, go mod t
 Request flow: MCP client → HTTP mux (`http.go`) → per-server middleware chain (recover, optional logging, optional bearer-token auth) → `server.MCPServer` (mcp-go) → proxied downstream client (`client.go`).
 
 - `main.go` — flag parsing and dispatch to one of three modes: normal server, `-authorize` (interactive OAuth), or `-auth-status`/`-doctor` (credential diagnostics).
-- `config.go` — the (only) V2 config schema, validation, and loading via `confstore` (supports local file or HTTP(S) URL, with env-var expansion). Per-server `Options` inherit from `mcpProxy.options` defaults during `load()`. The V1 schema was removed; `FullConfig` still carries the old `server`/`clients` keys as `json.RawMessage` purely so a V1 file fails with a migration hint instead of "mcpProxy is required".
+- `config.go` — the config schema, validation, and loading via `confstore` (supports local file or HTTP(S) URL, with env-var expansion). Per-server `Options` inherit from `mcpProxy.options` defaults during `load()`, `toolFilter` included; `mcpProxy.options.disabled` is rejected since `disabled` is per-server only. `Duration` fields are JSON strings only (`"30s"`); a bare number is rejected rather than read as nanoseconds.
 - `client.go` — wraps mcp-go clients for the three transports (`stdio`, `sse`, `streamable-http`). On startup, each client connects, initializes, and copies the downstream server's tools/prompts/resources/resource-templates onto the local `MCPServer` (with pagination and tool allow/block filtering). Every client gets a keepalive probe loop (`options.pingInterval`, default 30s) that drives the health state behind `/_readyz` — a real `tools/list` request on modern protocol connections (2026-07-28 removed ping), ping on legacy ones. `Client.connect` builds the transport, swaps it in under `mu`, and closes the previous one; tool/prompt/resource handlers resolve the live transport through `getClient()` at call time, so reconnecting is transparent to in-flight requests. `Start` gets the long-lived context — mcp-go's SSE transport ties its event stream to it and stdio stores it for request handling — so only `Initialize` is bounded by `connectTimeout`.
 - `oauth.go` / `oauth_store.go` — OAuth client support for downstream servers requiring interactive auth (e.g. Notion). Tokens and dynamically-registered client credentials persist as JSON under the user config dir (`~/.config/mcp-proxy/oauth/` on Linux) via `FileTokenStore`, so a one-off `-authorize` run shares state with the daemon. `oauthAwareError` decorates connection failures with re-auth hints.
 - `doctor.go` — backs `-auth-status` (local-only: config + cached token expiry) and `-doctor` (additionally connects to each remote server; may refresh tokens but never opens a browser).
@@ -60,6 +60,10 @@ subprocess instead of calling into the package, which is why they can live under
 - `test/e2e/stdio_test.go` — a stdio subprocess proxied over both proxy
   transports: tool/prompt/resource proxying, tool filtering, `env` reaching the
   subprocess, auth, readiness after a killed subprocess, graceful shutdown.
+- `test/e2e/stdio_stderr_test.go` — a stdio subprocess that floods stderr must
+  not deadlock: the proxy drains it via `drainStderr`.
+- `test/e2e/stdio_timeout_test.go` — a stdio tool call that never answers must
+  be bounded by `timeout`, not occupy the pipe forever.
 - `test/e2e/remote_test.go` — the outbound half, against an in-process
   `httptest` MCP server: the config's `headers` and `Accept-Encoding: identity`
   actually reaching the downstream, a slow server not blocking readiness, a

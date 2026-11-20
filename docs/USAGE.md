@@ -9,7 +9,12 @@
 -http-timeout int      timeout (seconds) for remote config fetch (default 10)
 -insecure              skip TLS verification for remote config
 -authorize string      run a one-time interactive OAuth authorization for the
-                        named mcpServers entry, then exit
+                        named mcpServers entry, then exit (opens a browser)
+-auth-status           list every configured server with its transport and auth
+                        state, then exit (local-only, no network calls)
+-doctor                like -auth-status, but also connects to each remote
+                        server to confirm credentials are accepted right now
+                        (may refresh an expired OAuth token; never opens a browser)
 -check-config          load and validate the config, then exit
 -log-level value       log level: debug, info, warn, or error (default info)
 -version               print version and exit
@@ -45,9 +50,12 @@ Two unauthenticated endpoints are always served for liveness/readiness probes
 - `/_healthz` (liveness) returns `200` as soon as the process serves requests. It
   is about this process only, so it stays `200` even when a downstream is down.
 - `/_readyz` (readiness) returns `503` with `"status":"initializing"` until every
-  enabled server has finished connecting and mounting its route, then `200`.
+  enabled server has finished connecting and mounting its route — or until
+  `mcpProxy.startupGracePeriod` elapses, so one slow downstream cannot keep the
+  proxy out of rotation — then `200`.
 - `/_readyz` returns `503` again with `"status":"degraded"` if a downstream that
-  had connected later stops answering: each connection is probed every 30s, and
+  had connected later stops answering: each connection is probed every
+  `pingInterval` (default 30s), and
   the servers that failed are listed in `unhealthy`. It takes three failed probes
   in a row, so a busy single-threaded server that misses one probe does not take
   the proxy out of rotation. Servers speaking the modern protocol (2026-07-28,
