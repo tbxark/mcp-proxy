@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"os/exec"
@@ -696,8 +697,55 @@ func redactURLCredentials(err error) error {
 // connection when autoReconnect is on; see recoverSession for why that is safe.
 func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return forward(ctx, c, func(ctx context.Context, cl *client.Client) (*mcp.CallToolResult, error) {
+		request.Params.Meta = stripHopMeta(request.Params.Meta)
 		return cl.CallTool(ctx, request)
 	})
+}
+
+// hopMetaKeys are the _meta fields that protocol version 2026-07-28 uses to
+// carry per-connection state (SEP-2575). On a proxied request they describe the
+// caller's connection to this proxy, not the proxy's connection to the
+// downstream, so they must not be forwarded:
+//
+//   - On a legacy downstream connection mcp-go adds no envelope of its own, so
+//     a modern caller's protocolVersion reaches a server that negotiated an
+//     older version, next to an Mcp-Protocol-Version header naming that older
+//     version. Strict servers, mcp-go's own streamable HTTP server included,
+//     reject every such request as a header mismatch.
+//   - On a modern downstream connection mcp-go overwrites protocolVersion,
+//     clientCapabilities and clientInfo with its own, but a caller's logLevel,
+//     serverInfo or subscriptionId would still leak through.
+//
+// The matching inbound HTTP headers are already dropped: mcp-go does not reuse
+// the Header of a request that was decoded from the wire (outboundHeader).
+var hopMetaKeys = []string{
+	mcp.MetaKeyProtocolVersion,
+	mcp.MetaKeyClientInfo,
+	mcp.MetaKeyClientCapabilities,
+	mcp.MetaKeyServerInfo,
+	mcp.MetaKeyLogLevel,
+	mcp.MetaKeySubscriptionID,
+}
+
+// stripHopMeta returns meta without hopMetaKeys, leaving the caller's value
+// untouched. Everything else, such as progressToken or a traceparent, passes
+// through.
+func stripHopMeta(meta *mcp.Meta) *mcp.Meta {
+	if meta == nil || len(meta.AdditionalFields) == 0 {
+		return meta
+	}
+	stripped := *meta
+	stripped.AdditionalFields = maps.Clone(meta.AdditionalFields)
+	for _, k := range hopMetaKeys {
+		delete(stripped.AdditionalFields, k)
+	}
+	if len(stripped.AdditionalFields) == 0 {
+		stripped.AdditionalFields = nil
+	}
+	if stripped.ProgressToken == nil && stripped.AdditionalFields == nil {
+		return nil
+	}
+	return &stripped
 }
 
 // drainStderr keeps reading a stdio subprocess's stderr for as long as it runs.
@@ -1035,6 +1083,7 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 			// tool call would.
 			prompts = append(prompts, server.ServerPrompt{Prompt: prompt, Handler: func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
 				return forward(ctx, c, func(ctx context.Context, live *client.Client) (*mcp.GetPromptResult, error) {
+					request.Params.Meta = stripHopMeta(request.Params.Meta)
 					return live.GetPrompt(ctx, request)
 				})
 			}})
@@ -1133,6 +1182,7 @@ func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *se
 // channel and takes the whole downstream unhealthy for every caller.
 func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 	readResource, err := forward(ctx, c, func(ctx context.Context, cl *client.Client) (*mcp.ReadResourceResult, error) {
+		request.Params.Meta = stripHopMeta(request.Params.Meta)
 		return cl.ReadResource(ctx, request)
 	})
 	if err != nil {
