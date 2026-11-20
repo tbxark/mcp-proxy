@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/mark3labs/mcp-go/client/transport"
 )
@@ -281,4 +282,38 @@ func saveRegisteredClient(serverName, clientID, clientSecret string) error {
 		return errors.New("cannot save an empty OAuth clientId")
 	}
 	return writePrivateJSON(path, registeredClient{ClientID: clientID, ClientSecret: clientSecret})
+}
+
+// tokenRefreshLeeway is how long before its recorded expiry an access token is
+// treated as expired, so mcp-go refreshes it ahead of time.
+//
+// mcp-go compares ExpiresAt with time.Now() and nothing else. A token is then
+// sent until the very instant it expires, and a request that leaves just
+// before that instant reaches the server after it: the server answers 401 and
+// the call fails with "no valid token available, authorization required".
+// The keepalive probe hits this on every rotation, because the refresh happens
+// on a probe tick and expires_in is usually a multiple of the probe interval
+// (900s / 30s), so the next expiry lands on a tick again.
+const tokenRefreshLeeway = 60 * time.Second
+
+// earlyRefreshTokenStore reports tokens as expiring tokenRefreshLeeway early
+// (at most a tenth of their lifetime, so a short-lived token is not refreshed
+// on every request). Only the copy handed to the OAuth handler is shifted;
+// the stored token, which -auth-status displays, keeps its real expiry.
+type earlyRefreshTokenStore struct {
+	transport.TokenStore
+}
+
+func (s earlyRefreshTokenStore) GetToken(ctx context.Context) (*transport.Token, error) {
+	token, err := s.TokenStore.GetToken(ctx)
+	if err != nil || token == nil || token.ExpiresAt.IsZero() {
+		return token, err
+	}
+	leeway := tokenRefreshLeeway
+	if token.ExpiresIn > 0 {
+		leeway = min(leeway, time.Duration(token.ExpiresIn)*time.Second/10)
+	}
+	shifted := *token
+	shifted.ExpiresAt = token.ExpiresAt.Add(-leeway)
+	return &shifted, nil
 }

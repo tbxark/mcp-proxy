@@ -5,6 +5,7 @@ import (
 	nethttp "net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -435,5 +436,20 @@ func TestLoadInheritsProxyOptions(t *testing.T) {
 	}
 	if got := overrides.reconnectInterval(); got != 2*time.Second {
 		t.Errorf("overridden reconnectInterval = %v, want 2s", got)
+	}
+}
+
+func TestQueryURLWarningIsLoggedOncePerURL(t *testing.T) {
+	t.Parallel()
+	// The set is process-wide, so make the key unique per run (-count=N).
+	name := t.Name() + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if !firstQueryURLWarning(name, "https://example.com/mcp?key=a") {
+		t.Fatal("first sighting of a query URL was not reported")
+	}
+	if firstQueryURLWarning(name, "https://example.com/mcp?key=a") {
+		t.Error("the same URL was reported twice")
+	}
+	if !firstQueryURLWarning(name, "https://example.com/mcp?key=b") {
+		t.Error("a changed URL was not reported again")
 	}
 }
