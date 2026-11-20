@@ -615,3 +615,37 @@ func TestNilOptionsClientDoesNotPanicOnConnect(t *testing.T) {
 	// process rather than this goroutine.
 	time.Sleep(100 * time.Millisecond)
 }
+
+// The proxy advertises only the capabilities it implements: no logging (it
+// does not forward log levels) and no resources.subscribe (it never emits
+// resources/updated nor forwards subscriptions).
+func TestNewMCPServerAdvertisedCapabilities(t *testing.T) {
+	t.Parallel()
+
+	s := newProxyServerForTest(t)
+	msg := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`)
+	raw, err := json.Marshal(s.HandleMessage(context.Background(), msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Result struct {
+			Capabilities struct {
+				Logging   *struct{} `json:"logging"`
+				Resources *struct {
+					Subscribe bool `json:"subscribe"`
+				} `json:"resources"`
+			} `json:"capabilities"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	caps := out.Result.Capabilities
+	if caps.Logging != nil {
+		t.Error("logging capability must not be advertised: the proxy does not implement logging")
+	}
+	if caps.Resources != nil && caps.Resources.Subscribe {
+		t.Error("resources.subscribe must not be advertised: the proxy does not forward subscriptions")
+	}
+}

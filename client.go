@@ -38,7 +38,6 @@ const (
 
 type Client struct {
 	name            string
-	needPing        bool
 	needManualStart bool
 	options         *OptionsV2
 	health          atomic.Int32
@@ -156,12 +155,8 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 	c.life, c.stopLife = context.WithCancel(context.Background())
 	switch v := clientInfo.(type) {
 	case *StdioMCPClientConfig:
-		// Stdio servers are pinged too: a crashed subprocess is the most
-		// common way a downstream disappears at runtime.
-		c.needPing = true
 		c.requestTimeout = time.Duration(v.Timeout)
 	case *SSEMCPClientConfig, *StreamableMCPClientConfig:
-		c.needPing = true
 		c.needManualStart = true
 	}
 	// The first transport is built here: for stdio that spawns the subprocess,
@@ -415,15 +410,13 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 		return err
 	}
 
-	if c.needPing {
-		c.pingOnce.Do(func() {
-			c.pingDone = make(chan struct{})
-			go func() {
-				defer close(c.pingDone)
-				c.startPingTask(ctx)
-			}()
-		})
-	}
+	c.pingOnce.Do(func() {
+		c.pingDone = make(chan struct{})
+		go func() {
+			defer close(c.pingDone)
+			c.startPingTask(ctx)
+		}()
+	})
 	return nil
 }
 
@@ -997,7 +990,9 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 				if err != nil {
 					slog.Error("Tool call failed", "client", c.name, "tool", toolName, "err", err)
 				} else if result != nil && result.IsError {
-					slog.Error("Tool call failed", "client", c.name, "tool", toolName, "isError", true)
+					// A tool-level failure the downstream reported itself, not
+					// a transport problem.
+					slog.Warn("Tool call failed", "client", c.name, "tool", toolName, "isError", true)
 				}
 				return result, err
 			}})
@@ -1185,17 +1180,11 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 	if clientConfig == nil {
 		return nil, errors.New("client config is required")
 	}
-	clientOptions := clientConfig.Options
-	if clientOptions == nil {
-		clientOptions = &OptionsV2{}
-	}
 	serverOpts := []server.ServerOption{
-		server.WithResourceCapabilities(true, true),
+		// The proxy does not forward resources/subscribe nor emit
+		// resources/updated, so only listChanged is advertised.
+		server.WithResourceCapabilities(false, true),
 		server.WithRecovery(),
-	}
-
-	if clientOptions.LogEnabled.OrElse(false) {
-		serverOpts = append(serverOpts, server.WithLogging())
 	}
 	mcpServer := server.NewMCPServer(
 		name,
