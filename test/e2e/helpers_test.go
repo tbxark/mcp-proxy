@@ -220,7 +220,8 @@ func launchProxy(t *testing.T, configPath, addr string) *proxy {
 	t.Cleanup(func() {
 		if !p.stopped {
 			_ = cmd.Process.Kill()
-			<-p.done
+			// Wait for the process to die; being killed is not a failure here.
+			t.Logf("proxy process exited: %v", <-p.done)
 		}
 	})
 
