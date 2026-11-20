@@ -157,7 +157,7 @@ looking, from the logs, like a refresh failure with no obvious cause.
 - `pingInterval` (duration string, default `"30s"`): how often the connection is probed
   to keep it alive and to notice it died. This is how quickly `/_readyz` turns
   `degraded` after a downstream goes away.
-- `logEnabled` (bool): Log requests and events for this client.
+- `logEnabled` (bool): Log each incoming HTTP request (method and path) for this server.
 - `authTokens` ([]string): Valid bearer tokens; requests must include
   `Authorization: Bearer <token>` (a bare token is also accepted).
 - `toolFilter` (object): Selectively expose tools to the proxy:
