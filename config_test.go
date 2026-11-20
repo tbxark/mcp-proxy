@@ -437,4 +437,3 @@ func TestLoadInheritsProxyOptions(t *testing.T) {
 		t.Errorf("overridden reconnectInterval = %v, want 2s", got)
 	}
 }
-

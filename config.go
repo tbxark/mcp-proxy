@@ -620,4 +620,3 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 	}
 	return config, nil
 }
-

@@ -206,6 +206,13 @@ fallback, so an existing registration keeps working.)
   not by `reconnectInterval`. With the defaults (30s probe, three failures) a dropped
   connection recovers in roughly 90s plus connect time; shorten `pingInterval` to recover
   faster.
+  One kind of drop does not wait for the threshold: a `streamable-http` downstream that
+  restarts forgets the session the proxy holds, and that is final - no later probe can
+  succeed on it. With `autoReconnect` the connection is rebuilt as soon as the lost session
+  is noticed, by the keepalive probe or by a forwarded request; such a request is then
+  retried once on the new connection, which is safe because the server refused it before
+  any handler ran. Without `autoReconnect` the client is reported unhealthy right away and
+  stays unhealthy until the proxy is restarted.
 
 Notes:
 
