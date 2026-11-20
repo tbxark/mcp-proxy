@@ -530,7 +530,7 @@ func TestFatalStartupErrorIsRedacted(t *testing.T) {
 
 	panicIfInvalid := optional.NewField(true)
 
-	fatal := fatalStartupError(&MCPClientConfigV2{Options: &OptionsV2{PanicIfInvalid: panicIfInvalid}}, urlErr)
+	fatal := startupFailed("test", &MCPClientConfigV2{Options: &OptionsV2{PanicIfInvalid: panicIfInvalid}}, urlErr)
 	if fatal == nil {
 		t.Fatal("panicIfInvalid should make the failure fatal")
 	}
@@ -543,7 +543,7 @@ func TestFatalStartupErrorIsRedacted(t *testing.T) {
 	}
 
 	// Without panicIfInvalid the failure is not fatal at all.
-	if got := fatalStartupError(&MCPClientConfigV2{Options: &OptionsV2{}}, urlErr); got != nil {
+	if got := startupFailed("test", &MCPClientConfigV2{Options: &OptionsV2{}}, urlErr); got != nil {
 		t.Errorf("a non-fatal startup error should return nil, got %v", got)
 	}
 }

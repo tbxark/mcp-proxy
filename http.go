@@ -171,29 +171,23 @@ type readinessReport struct {
 	unhealthy []string
 }
 
-// fatalStartupError applies the panicIfInvalid half of the per-server failure
-// policy: it returns err when that server asked for a fast, fatal failure, and
-// nil otherwise. It deliberately does not log, because the caller knows whether
-// the failure is terminal (log an error) or about to be retried (log nothing;
-// the retry line carries the detail). Logging here unconditionally would emit
-// an ERROR for every retry attempt of a backend that is simply not up yet.
+// startupFailed reports a downstream that could not be started and will not be
+// retried, so the rest of the proxy still serves. It is only for terminal
+// failures: an attempt about to be retried logs its WARN retry line instead
+// (an unreachable backend is not an error), and logging both would emit an
+// ERROR for every retry of a backend that is simply not up yet.
 //
-// The returned error is redacted, because it is propagated out of the startup
-// errorGroup and logged by main: a transport error embeds the downstream URL,
-// which may carry a credential in its query.
-func fatalStartupError(clientConfig *MCPClientConfigV2, err error) error {
+// The error is redacted before it is logged or returned: it is propagated out
+// of the startup errorGroup and logged by main, and a transport error embeds
+// the downstream URL, which may carry a credential in its query. The returned
+// error is non-nil when panicIfInvalid makes the failure fatal for the whole
+// process.
+func startupFailed(name string, clientConfig *MCPClientConfigV2, err error) error {
+	slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
 	if clientConfig.Options.panicIfInvalid() {
 		return redactURLCredentials(err)
 	}
 	return nil
-}
-
-// clientStartupError reports a downstream that could not be started and will
-// not be retried, so the rest of the proxy still serves. It returns err when
-// panicIfInvalid makes the failure fatal for the whole process.
-func clientStartupError(name string, clientConfig *MCPClientConfigV2, err error) error {
-	slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
-	return fatalStartupError(clientConfig, err)
 }
 
 // permanentStartupError reports whether retrying cannot help: a downstream that
@@ -248,7 +242,8 @@ func startHTTPServer(config *Config) error {
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 	info := mcp.Implementation{
-		Name: config.McpProxy.Name,
+		Name:    config.McpProxy.Name,
+		Version: config.McpProxy.Version,
 	}
 	// clients is filled in from the per-server goroutines below.
 	var clientsMu sync.Mutex
@@ -295,7 +290,7 @@ func startHTTPServer(config *Config) error {
 		// runs exactly once per server; a backend that was down at startup and
 		// connects later is mounted then, by the retry below.
 		var mountOnce sync.Once
-		mountRoute := func(mcpClient *Client, server *Server) {
+		mountRoute := func(server *Server) {
 			mountOnce.Do(func() {
 				// Outermost first: recover also guards the middlewares below it,
 				// and the logger records requests that auth rejects.
@@ -316,12 +311,6 @@ func startHTTPServer(config *Config) error {
 				}
 				slog.Info("Handling requests", "client", name, "route", mcpRoute)
 				httpMux.Handle(mcpRoute, chainMiddleware(server.handler, middlewares...))
-				httpServer.RegisterOnShutdown(func() {
-					slog.Info("Shutting down", "client", name)
-					if cErr := mcpClient.Close(); cErr != nil {
-						slog.Error("Failed to close client", "client", name, "err", cErr)
-					}
-				})
 			})
 		}
 
@@ -330,10 +319,16 @@ func startHTTPServer(config *Config) error {
 			autoReconnect := clientConfig.Options.autoReconnect()
 			interval := clientConfig.Options.reconnectInterval()
 
-			var (
-				mcpClient *Client
-				server    *Server
-			)
+			// Build the server first: it depends only on the config, so it is
+			// never retried - and building it before the client means a
+			// construction failure cannot leave a stdio subprocess (spawned by
+			// newMCPClient) running until shutdown.
+			server, sErr := newMCPServer(name, config.McpProxy, clientConfig)
+			if sErr != nil {
+				return startupFailed(name, clientConfig, sErr)
+			}
+
+			var mcpClient *Client
 			for {
 				// Creating a stdio client already spawns the subprocess, so a
 				// missing command fails here rather than while connecting. Both
@@ -341,16 +336,8 @@ func startHTTPServer(config *Config) error {
 				if mcpClient == nil {
 					created, err := newMCPClient(name, clientConfig)
 					if err != nil {
-						// Terminal unless it will be retried: log an error for a
-						// failure that ends the attempt, and stay quiet on the
-						// retry path (an unreachable backend is not an error).
-						if fatal := fatalStartupError(clientConfig, err); fatal != nil {
-							slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
-							return fatal
-						}
-						if !autoReconnect {
-							slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
-							return nil
+						if !autoReconnect || clientConfig.Options.panicIfInvalid() {
+							return startupFailed(name, clientConfig, err)
 						}
 						slog.Warn("Retrying client creation", "client", name, "err", redactURLCredentials(err), "retryIn", interval)
 						if !retryWait(ctx, interval) {
@@ -373,33 +360,23 @@ func startHTTPServer(config *Config) error {
 					}
 					clients[name] = mcpClient
 					clientsMu.Unlock()
-
-					newServer, sErr := newMCPServer(name, config.McpProxy, clientConfig)
-					if sErr != nil {
-						// A malformed server definition will not fix itself, so
-						// it is never retried.
-						return clientStartupError(name, clientConfig, sErr)
-					}
-					server = newServer
 				}
 
 				err := mcpClient.addToMCPServer(ctx, info, server.mcpServer)
 				if err == nil {
 					slog.Info("Connected", "client", name)
-					mountRoute(mcpClient, server)
+					mountRoute(server)
 					return nil
 				}
-				if fatal := fatalStartupError(clientConfig, err); fatal != nil {
-					slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
-					return fatal
+				if clientConfig.Options.panicIfInvalid() {
+					return startupFailed(name, clientConfig, err)
 				}
 				if mcpClient.closed.Load() {
 					// Shutdown already closed this client; not a startup error.
 					return nil
 				}
 				if !autoReconnect {
-					slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
-					return nil
+					return startupFailed(name, clientConfig, err)
 				}
 				if permanentStartupError(err) {
 					// Retrying cannot help - interactive OAuth is needed. Report
