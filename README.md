@@ -55,6 +55,10 @@ An online Claude config converter is available at: https://tbxark.github.io/mcp-
 
 Command‑line flags, endpoints, and auth examples are documented in [docs/USAGE.md](docs/USAGE.md).
 
+## Contributing
+
+Examples for individual third-party or commercial MCP services are not accepted; generic examples live in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
 ## Thanks
 
 - This project was inspired by the [adamwattis/mcp-proxy-server](https://github.com/adamwattis/mcp-proxy-server) project

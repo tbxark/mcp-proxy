@@ -258,6 +258,10 @@
     }
 
     function convertToCodex(fromConfig) {
+        if (fromConfig?.mcpProxy?.type === 'sse') {
+            return '# Codex only supports streamable HTTP MCP servers.\n' +
+                '# Set mcpProxy.type to "streamable-http" to generate a Codex config.';
+        }
         const lines = [];
         for (const server of collectServers(fromConfig)) {
             lines.push(`[mcp_servers.${tomlKey(server.key)}]`);

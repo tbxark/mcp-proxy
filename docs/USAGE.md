@@ -109,7 +109,7 @@ Authorization: Bearer <token>
 Authorization: <token>
 ```
 
-If your client cannot set headers, embed the token in the route key (e.g. `fetch/<token>`) and call that path instead.
+If your client cannot set headers, embed the token in the route key (e.g. `fetch/<token>`) and call that path instead. Be aware that the token then becomes part of the server name: it appears in every log line for that server, in the startup route log, and in the unauthenticated `/_readyz` `unhealthy` list. Only use this when the port and the proxy's logs are private.
 
 ## OAuth-authorizing a downstream server
 

@@ -65,9 +65,25 @@ services:
 
 When mcp-proxy listens on loopback behind nginx/Caddy, forward the public Host that matches the hostname of `mcpProxy.baseURL` (or use `localhost`): on loopback connections any other Host value is rejected with `403 Forbidden` as DNS-rebinding protection.
 
+## Running as non-root
+
+The image runs as root by default. To run as an unprivileged user:
+
+```bash
+docker run -d \
+  --user 10001:10001 \
+  -e HOME=/home/mcp \
+  -v mcp-home:/home/mcp \
+  -v /path/to/config.json:/config/config.json \
+  -p 9090:9090 \
+  ghcr.io/tbxark/mcp-proxy:latest
+```
+
+`HOME` must be writable: `npx`/`uvx` keep their package caches there, and OAuth tokens and registered client credentials persist under the user config dir (`$HOME/.config/mcp-proxy/oauth/`). A mounted config file must be readable by that UID.
+
 ## Security Notes
 
 - Prefer `authTokens` per downstream server; only use the `mcpProxy` default when appropriate.
-- If an MCP client cannot set headers, you can embed a token in the route key (e.g. `fetch/<token>`) and route via that path.
+- If an MCP client cannot set headers, you can embed a token in the route key (e.g. `fetch/<token>`) and route via that path. The token then becomes part of the server name: it shows up in every log line for that server, in the startup route log, and in the unauthenticated `/_readyz` `unhealthy` list. Only use this when the port and the proxy's logs are private.
 - Set `options.panicIfInvalid: true` for critical servers to fail fast on misconfiguration.
 
