@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -71,9 +72,9 @@ func (d *downstreamRecorder) values(key string) []string {
 	return seen
 }
 
-// newDownstreamHandler builds the minimal echo MCP server these tests proxy to,
-// returning the handler and the route suffix its transport expects.
-func newDownstreamHandler(transportType string) (http.Handler, string) {
+// newEchoMCPServer builds the minimal downstream these tests proxy to. The
+// returned server can be mutated mid-run (e.g. AddTool to emit list_changed).
+func newEchoMCPServer() *server.MCPServer {
 	mcpServer := server.NewMCPServer("downstream", "1.0.0", server.WithToolCapabilities(true))
 	mcpServer.AddTool(
 		mcp.NewTool("echo", mcp.WithString("message", mcp.Required())),
@@ -85,7 +86,13 @@ func newDownstreamHandler(transportType string) (http.Handler, string) {
 			return mcp.NewToolResultText("downstream:" + message), nil
 		},
 	)
+	return mcpServer
+}
 
+// newDownstreamHandler builds the minimal echo MCP server these tests proxy to,
+// returning the handler and the route suffix its transport expects.
+func newDownstreamHandler(transportType string) (http.Handler, string) {
+	mcpServer := newEchoMCPServer()
 	if transportType == "sse" {
 		return server.NewSSEServer(mcpServer), "/sse"
 	}
@@ -100,6 +107,15 @@ func startDownstreamOnAddr(t *testing.T, addr, transportType string) *httptest.S
 	t.Helper()
 
 	handler, _ := newDownstreamHandler(transportType)
+	return serveOnAddr(t, addr, handler)
+}
+
+// serveOnAddr runs handler on a fixed address, retrying the bind briefly and
+// dropping client connections before Close so a subscription stream the proxy
+// holds open cannot hang the teardown.
+func serveOnAddr(t *testing.T, addr string, handler http.Handler) *httptest.Server {
+	t.Helper()
+
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		listener, err := net.Listen("tcp", addr)
@@ -649,5 +665,126 @@ func TestAutoReconnectStopsOnPermanentAuthError(t *testing.T) {
 	}
 	if !strings.Contains(logs, "mcp-proxy -authorize") {
 		t.Errorf("the failure did not carry the actionable authorize hint\n%s", logs)
+	}
+}
+
+// A stateful streamable-http downstream loses its session when it restarts:
+// the rebuilt server does not know the session id it handed out before. The
+// forwarded call must trigger the session-loss recovery (with autoReconnect)
+// and come back with a result, not a permanent transport error.
+func TestStatefulDownstreamRestartKeepsRoute(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	downstreamAddr := freeAddr(t)
+	downstreamURL := "http://" + downstreamAddr + "/mcp"
+	configPath, addr := autoReconnectConfig(t, downstreamURL,
+		`{"autoReconnect": true, "reconnectInterval": "100ms"}`)
+
+	stateful := func() *httptest.Server {
+		return serveOnAddr(t, downstreamAddr,
+			server.NewStreamableHTTPServer(newEchoMCPServer()))
+	}
+	downstream := stateful()
+	proxy := startProxy(t, configPath, addr)
+
+	mcpClient := proxy.connect(t, "streamable-http", "remote")
+	if got := callToolText(t, mcpClient, "echo", map[string]any{"message": "before"}); got != "downstream:before" {
+		t.Fatalf("echo before the restart = %q, want %q", got, "downstream:before")
+	}
+
+	// Restart on the same address: the new server instance has never seen the
+	// session id the proxy's client still presents.
+	downstream.CloseClientConnections()
+	downstream.Close()
+	downstream = stateful()
+	defer downstream.Close()
+
+	ctx := testContext(t)
+	request := mcp.CallToolRequest{}
+	request.Params.Name = "echo"
+	request.Params.Arguments = map[string]any{"message": "after"}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		result, err := mcpClient.CallTool(ctx, request)
+		if err == nil && !result.IsError {
+			if got := resultText(t, result); got == "downstream:after" {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("calls through a restarted session did not recover within 10s: %v\n%s",
+				err, proxy.stderr.String())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// A downstream that gains a tool mid-run announces tools/list_changed, and the
+// proxy must re-list and re-publish it. SSE downstreams push the notification
+// on their event stream; a modern streamable-http downstream delivers it on
+// the subscriptions/listen stream the proxy opted in to.
+func TestDownstreamListChangedRefreshesCatalog(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	for _, transportType := range []string{"sse", "streamable-http"} {
+		t.Run(transportType, func(t *testing.T) {
+			t.Parallel()
+
+			mcpServer := newEchoMCPServer()
+			var downstream *httptest.Server
+			var downstreamURL string
+			if transportType == "sse" {
+				downstream = httptest.NewServer(server.NewSSEServer(mcpServer))
+				downstreamURL = downstream.URL + "/sse"
+			} else {
+				downstream = httptest.NewServer(server.NewStreamableHTTPServer(mcpServer))
+				downstreamURL = downstream.URL + "/mcp"
+			}
+			t.Cleanup(func() {
+				downstream.CloseClientConnections()
+				downstream.Close()
+			})
+
+			configPath, addr := remoteConfig(t, transportType, downstreamURL)
+			proxy := startProxy(t, configPath, addr)
+			mcpClient := proxy.connect(t, "streamable-http", "remote")
+
+			toolNames := func() []string {
+				listed, err := mcpClient.ListTools(testContext(t), mcp.ListToolsRequest{})
+				if err != nil {
+					t.Fatalf("list tools through the proxy: %v", err)
+				}
+				names := make([]string, 0, len(listed.Tools))
+				for _, tool := range listed.Tools {
+					names = append(names, tool.Name)
+				}
+				slices.Sort(names)
+				return names
+			}
+			if got := toolNames(); !slices.Equal(got, []string{"echo"}) {
+				t.Fatalf("tools before the change = %v, want [echo]", got)
+			}
+
+			mcpServer.AddTool(
+				mcp.NewTool("added"),
+				func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+					return mcp.NewToolResultText("new"), nil
+				},
+			)
+
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				if got := toolNames(); slices.Equal(got, []string{"added", "echo"}) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the added tool did not reach the proxy catalog within 10s\n%s",
+						proxy.stderr.String())
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		})
 	}
 }

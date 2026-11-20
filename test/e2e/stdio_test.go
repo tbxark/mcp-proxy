@@ -2,7 +2,9 @@ package e2e
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -294,4 +296,65 @@ func TestReadinessReflectsDownstreamHealth(t *testing.T) {
 
 	// A downstream that died must not make the proxy's own exit status non-zero.
 	proxy.stop(t)
+}
+
+// promptFilter and resourceFilter take effect through the real config path:
+// the hidden prompt cannot be fetched, and a URI the block list names stays
+// unreadable even though the template serving it is still exposed.
+func TestFiltersBlockPromptsAndResourceReads(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	addr := freeAddr(t)
+	fixture := buildFixture(t)
+	configPath := writeConfig(t, fmt.Sprintf(`{
+  "mcpProxy": {
+    "baseURL": "http://%[1]s", "addr": "%[1]s", "name": "p", "version": "1",
+    "type": "streamable-http", "startupGracePeriod": "`+testGracePeriod+`",
+    "options": {"authTokens": ["`+testAuthToken+`"]}
+  },
+  "mcpServers": {
+    "fixture": {
+      "command": "%[2]s",
+      "options": {
+        "promptFilter": {"mode": "block", "list": ["summarize"]},
+        "resourceFilter": {"mode": "block", "list": ["test://echo/secret"]}
+      }
+    }
+  }
+}`, addr, filepath.ToSlash(fixture)))
+
+	proxy := startProxy(t, configPath, addr)
+	mcpClient := proxy.connect(t, "streamable-http", "fixture")
+
+	ctx := testContext(t)
+	prompts, err := mcpClient.ListPrompts(ctx, mcp.ListPromptsRequest{})
+	if err != nil {
+		t.Fatalf("list prompts: %v", err)
+	}
+	promptNames := make([]string, 0, len(prompts.Prompts))
+	for _, prompt := range prompts.Prompts {
+		promptNames = append(promptNames, prompt.Name)
+	}
+	slices.Sort(promptNames)
+	if want := []string{"greeting", "translate"}; !slices.Equal(promptNames, want) {
+		t.Fatalf("prompts = %v, want %v (summarize filtered)", promptNames, want)
+	}
+
+	getPrompt := mcp.GetPromptRequest{}
+	getPrompt.Params.Name = "summarize"
+	if _, err := mcpClient.GetPrompt(ctx, getPrompt); err == nil {
+		t.Error("the filtered prompt was still fetchable")
+	}
+
+	// The echo template is exposed, but the blocked URI must still refuse: the
+	// filter is enforced at read time, not only at listing.
+	if got := readResourceText(t, mcpClient, "test://echo/hi"); got != "echo:hi" {
+		t.Errorf("templated resource = %q, want %q", got, "echo:hi")
+	}
+	read := mcp.ReadResourceRequest{}
+	read.Params.URI = "test://echo/secret"
+	if _, err := mcpClient.ReadResource(ctx, read); err == nil {
+		t.Error("the block-listed URI was readable through the exposed template")
+	}
 }
