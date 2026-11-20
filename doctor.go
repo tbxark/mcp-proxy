@@ -232,9 +232,13 @@ func checkServerLive(res *doctorResult, conf *MCPClientConfigV2) {
 	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initRequest.Params.ClientInfo = mcp.Implementation{Name: "mcp-proxy-doctor", Version: BuildVersion}
 	if _, err := mcpClient.client.Initialize(ctx, initRequest); err != nil {
-		res.ok = false
-		res.live = liveFailureMessage(res.name, err)
-		return
+		retry, _, retryErr := mcpClient.retryPinnedLegacy(ctx, ctx, mcpClient.client, initRequest, err)
+		mcpClient.client = retry
+		if retryErr != nil {
+			res.ok = false
+			res.live = liveFailureMessage(res.name, retryErr)
+			return
+		}
 	}
 	// Initialization may have refreshed the persisted OAuth token.
 	*res = checkServerAuth(res.name, conf)

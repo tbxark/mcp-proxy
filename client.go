@@ -187,22 +187,35 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 // It is called once at construction and again on every reconnect, so a dead
 // backend (closed Obsidian, crashed stdio server) is replaced rather than
 // reused.
-func (c *Client) buildRawClient() (*client.Client, error) {
-	return newRawClient(c.name, c.clientConf)
+func (c *Client) buildRawClient(extra ...client.ClientOption) (*client.Client, error) {
+	return newRawClient(c.name, c.clientConf, extra...)
 }
 
 // newRawClient builds an mcp-go client for one parsed transport config. It is
 // shared by Client (connect and reconnect) and the one-off -authorize flow.
-func newRawClient(name string, conf any) (*client.Client, error) {
+// extra carries client-level options the convenience constructors cannot take
+// (a protocol version pin on the legacy fallback), so the transports are
+// assembled by hand.
+func newRawClient(name string, conf any, extra ...client.ClientOption) (*client.Client, error) {
 	switch v := conf.(type) {
 	case *StdioMCPClientConfig:
 		envs := make([]string, 0, len(v.Env))
 		for kk, vv := range v.Env {
 			envs = append(envs, fmt.Sprintf("%s=%s", kk, vv))
 		}
-		raw, err := client.NewStdioMCPClient(v.Command, envs, v.Args...)
-		if err != nil {
-			return nil, err
+		var raw *client.Client
+		if len(extra) == 0 {
+			var err error
+			raw, err = client.NewStdioMCPClient(v.Command, envs, v.Args...)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			stdioTransport := transport.NewStdioWithOptions(v.Command, envs, v.Args)
+			if err := stdioTransport.Start(context.Background()); err != nil {
+				return nil, fmt.Errorf("failed to start stdio transport: %w", err)
+			}
+			raw = client.NewClient(stdioTransport, extra...)
 		}
 		drainStderr(name, raw)
 		return raw, nil
@@ -213,9 +226,13 @@ func newRawClient(name string, conf any) (*client.Client, error) {
 			if err != nil {
 				return nil, err
 			}
-			return client.NewOAuthSSEClient(v.URL, oc, options...)
+			options = append(options, transport.WithOAuth(oc))
 		}
-		return client.NewSSEMCPClient(v.URL, options...)
+		sseTransport, err := transport.NewSSE(v.URL, options...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create SSE transport: %w", err)
+		}
+		return client.NewClient(sseTransport, extra...), nil
 	case *StreamableMCPClientConfig:
 		options := streamableClientOptions(v)
 		if v.OAuth != nil {
@@ -223,9 +240,17 @@ func newRawClient(name string, conf any) (*client.Client, error) {
 			if err != nil {
 				return nil, err
 			}
-			return client.NewOAuthStreamableHttpClient(v.URL, oc, options...)
+			options = append(options, transport.WithHTTPOAuth(oc))
 		}
-		return client.NewStreamableHttpClient(v.URL, options...)
+		httpTransport, err := transport.NewStreamableHTTP(v.URL, options...)
+		if err != nil {
+			return nil, err
+		}
+		opts := extra
+		if sessionID := httpTransport.GetSessionId(); sessionID != "" {
+			opts = append([]client.ClientOption{client.WithSession()}, opts...)
+		}
+		return client.NewClient(httpTransport, opts...), nil
 	}
 	return nil, errors.New("invalid client type")
 }
@@ -307,6 +332,9 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 		Sampling:     nil,
 	}
 	initResult, err := raw.Initialize(initCtx, initRequest)
+	if err != nil {
+		raw, initResult, err = c.retryPinnedLegacy(ctx, initCtx, raw, initRequest, err)
+	}
 	if err != nil {
 		c.forget(raw)
 		return oauthAwareError(c.name, err)
@@ -397,6 +425,47 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 
 	c.health.Store(int32(healthOK))
 	return nil
+}
+
+// retryPinnedLegacy retries the initialize handshake pinned to a legacy
+// protocol version when raw's failure shows the downstream only speaks legacy
+// versions. mcp-go probes server/discover during Initialize; a downstream
+// that version-checks the request and rejects 2026-07-28 with an
+// UnsupportedProtocolVersionError listing only legacy versions (mcp-go built
+// with WithStreamableHTTPProtocolVersions restricted to the legacy set, for
+// one) is classified there as a modern server that wants a different modern
+// version, so no initialize handshake is ever tried. On success the returned
+// client replaces raw — it is a different transport, already started and
+// initialized.
+func (c *Client) retryPinnedLegacy(ctx, initCtx context.Context, raw *client.Client, initRequest mcp.InitializeRequest, initErr error) (*client.Client, *mcp.InitializeResult, error) {
+	unsupported, ok := errors.AsType[mcp.UnsupportedProtocolVersionError](initErr)
+	if !ok {
+		return raw, nil, initErr
+	}
+	pinned := mcp.NegotiateMutuallySupportedVersion(unsupported.Supported)
+	if pinned == "" || mcp.IsModernProtocol(pinned) {
+		return raw, nil, initErr
+	}
+	slog.Info("Downstream supports only legacy protocol versions, retrying the initialize handshake", "client", c.name, "version", pinned)
+	_ = raw.Close()
+	fallback, err := c.buildRawClient(client.WithProtocolVersion(pinned))
+	if err != nil {
+		return raw, nil, err
+	}
+	fallback.OnNotification(func(n mcp.JSONRPCNotification) {
+		c.onDownstreamNotification(fallback, n)
+	})
+	if c.needManualStart {
+		if err := fallback.Start(ctx); err != nil {
+			c.forget(fallback)
+			return fallback, nil, oauthAwareError(c.name, err)
+		}
+	}
+	initResult, err := fallback.Initialize(initCtx, initRequest)
+	if err != nil {
+		c.forget(fallback)
+	}
+	return fallback, initResult, err
 }
 
 // onDownstreamNotification handles a notification received on transport raw.

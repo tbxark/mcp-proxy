@@ -166,8 +166,9 @@ func TestDoctorUpdatesAuthStatusAfterTokenRefresh(t *testing.T) {
 		URL:           remote.URL + "/mcp",
 		OAuth:         &OAuthClientConfig{ClientID: "test", AuthServerMetadataURL: remote.URL + "/metadata"},
 	}
+	// mcp-go only refreshes a token bound to the authorization server's issuer.
 	writeTestToken(t, "refreshable", &transport.Token{
-		AccessToken: "expired", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Hour),
+		Issuer: remote.URL, AccessToken: "expired", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Hour),
 	})
 	res := checkServerAuth("refreshable", conf)
 	if res.ok || !strings.HasPrefix(res.status, "EXPIRED") {
