@@ -34,7 +34,7 @@ func TestParseRedirectURI(t *testing.T) {
 	}
 	for _, tt := range valid {
 		t.Run(tt.name, func(t *testing.T) {
-			path, addr, err := parseRedirectURI(tt.raw)
+			path, addr, err := parseRedirectURI(tt.raw, false)
 			if err != nil {
 				t.Fatalf("parse redirect URI: %v", err)
 			}
@@ -61,11 +61,82 @@ func TestParseRedirectURI(t *testing.T) {
 	}
 	for _, tt := range invalid {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := parseRedirectURI(tt.raw)
+			_, _, err := parseRedirectURI(tt.raw, false)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("error = %v, want substring %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// With oauth.callbackListen the redirect URI is only where the provider sends
+// the browser, so a public https URL is allowed.
+func TestParseRedirectURIBehindProxy(t *testing.T) {
+	t.Parallel()
+
+	valid := []struct {
+		name     string
+		raw      string
+		wantPath string
+	}{
+		{name: "public https", raw: "https://gateway.example.net/oauth/callback", wantPath: "/oauth/callback"},
+		{name: "public https with port", raw: "https://gateway.example.net:8443/cb", wantPath: "/cb"},
+		{name: "loopback http", raw: "http://localhost:8090/cb", wantPath: "/cb"},
+	}
+	for _, tt := range valid {
+		t.Run(tt.name, func(t *testing.T) {
+			path, _, err := parseRedirectURI(tt.raw, true)
+			if err != nil {
+				t.Fatalf("parse redirect URI: %v", err)
+			}
+			if path != tt.wantPath {
+				t.Fatalf("path = %q, want %q", path, tt.wantPath)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name    string
+		raw     string
+		wantErr string
+	}{
+		{name: "public http", raw: "http://gateway.example.net/cb", wantErr: "must use https"},
+		{name: "other scheme", raw: "ftp://gateway.example.net/cb", wantErr: "http or https"},
+		{name: "invalid port", raw: "https://gateway.example.net:70000/cb", wantErr: "invalid port"},
+		{name: "root path", raw: "https://gateway.example.net/", wantErr: "callback path"},
+	}
+	for _, tt := range invalid {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := parseRedirectURI(tt.raw, true)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseCallbackListen(t *testing.T) {
+	t.Parallel()
+
+	for _, addr := range []string{"127.0.0.1:8090", "localhost:9000", "[::1]:9001"} {
+		if got, err := parseCallbackListen(addr); err != nil || got != addr {
+			t.Errorf("parseCallbackListen(%q) = (%q, %v), want it unchanged", addr, got, err)
+		}
+	}
+
+	invalid := []struct {
+		raw     string
+		wantErr string
+	}{
+		{raw: "0.0.0.0:8090", wantErr: "loopback"},
+		{raw: ":8090", wantErr: "loopback"},
+		{raw: "127.0.0.1", wantErr: "host:port"},
+		{raw: "127.0.0.1:70000", wantErr: "invalid port"},
+	}
+	for _, tt := range invalid {
+		if _, err := parseCallbackListen(tt.raw); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+			t.Errorf("parseCallbackListen(%q) error = %v, want substring %q", tt.raw, err, tt.wantErr)
+		}
 	}
 }
 

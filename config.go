@@ -92,6 +92,12 @@ type OAuthClientConfig struct {
 	// some providers (e.g. Datadog) only serve it at the RFC 8414
 	// location.
 	AuthServerMetadataURL string `json:"authServerMetadataUrl,omitempty"`
+	// CallbackListen is the loopback host:port the callback listener binds
+	// to, for when RedirectURI is not the listener's own address but one a
+	// reverse proxy on the same host serves and forwards here. Empty keeps
+	// the default, where the listener binds to the host and port of
+	// RedirectURI.
+	CallbackListen string `json:"callbackListen,omitempty"`
 
 	// ignoreSavedClient makes buildOAuthConfig leave out the dynamically
 	// registered client saved on disk. -authorize sets it when that client
@@ -488,11 +494,20 @@ func validateConfig(config *Config) error {
 			if serverConfig.OAuth.ClientID == "" && serverConfig.OAuth.ClientSecret != "" {
 				return fmt.Errorf("%s.oauth.clientSecret requires clientId", field)
 			}
+			callbackListen := serverConfig.OAuth.CallbackListen
+			if callbackListen != "" {
+				if serverConfig.OAuth.RedirectURI == "" {
+					return fmt.Errorf("%s.oauth.callbackListen requires redirectUri", field)
+				}
+				if _, err := parseCallbackListen(callbackListen); err != nil {
+					return fmt.Errorf("%s.oauth.callbackListen: %w", field, err)
+				}
+			}
 			redirectURI := serverConfig.OAuth.RedirectURI
 			if redirectURI == "" {
 				redirectURI = defaultOAuthRedirectURI
 			}
-			if _, _, err := parseRedirectURI(redirectURI); err != nil {
+			if _, _, err := parseRedirectURI(redirectURI, callbackListen != ""); err != nil {
 				return fmt.Errorf("%s.oauth.redirectUri: %w", field, err)
 			}
 			if metadataURL := serverConfig.OAuth.AuthServerMetadataURL; metadataURL != "" {

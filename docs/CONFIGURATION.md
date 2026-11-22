@@ -141,8 +141,16 @@ as the OAuth client on the downstream connection:
 - `redirectUri` (optional): local callback URL used during the one-time
   interactive authorization. Defaults to `http://localhost:8090/oauth/callback`.
   It must use `http`, a loopback host (`localhost`, `127.0.0.1`, or `::1`), an
-  explicit port, and a non-root callback path. The callback listener never
-  binds to a public interface.
+  explicit port, and a non-root callback path (see `callbackListen` for a
+  public `https` URL). The callback listener never binds to a public
+  interface.
+- `callbackListen` (optional): loopback `host:port` the callback listener
+  binds to, instead of the host and port of `redirectUri`. For a machine
+  without a browser, such as a headless server. `redirectUri` is then
+  required, and may also be an `https` URL on any host, with or without a
+  port: a reverse proxy on the same machine serves it and forwards the
+  callback path, unchanged, to `callbackListen`. See
+  [USAGE.md](USAGE.md#authorizing-on-a-machine-without-a-browser).
 - `scopes` (optional): OAuth scopes to request.
 - `pkceDisabled` (bool, optional): disable PKCE. PKCE is enabled by default.
 - `authServerMetadataUrl` (optional): override discovery of the authorization
