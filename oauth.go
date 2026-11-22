@@ -36,12 +36,8 @@ func buildOAuthConfig(serverName string, conf *OAuthClientConfig) (transport.OAu
 	if err != nil {
 		return transport.OAuthConfig{}, err
 	}
-	redirectURI := conf.RedirectURI
-	if redirectURI == "" {
-		redirectURI = defaultOAuthRedirectURI
-	}
 	clientID, clientSecret := conf.ClientID, conf.ClientSecret
-	if clientID == "" {
+	if clientID == "" && !conf.ignoreSavedClient {
 		regClientID, regClientSecret, ok, rErr := loadRegisteredClient(serverName)
 		if rErr != nil {
 			return transport.OAuthConfig{}, rErr
@@ -53,7 +49,7 @@ func buildOAuthConfig(serverName string, conf *OAuthClientConfig) (transport.OAu
 	return transport.OAuthConfig{
 		ClientID:              clientID,
 		ClientSecret:          clientSecret,
-		RedirectURI:           redirectURI,
+		RedirectURI:           oauthRedirectURI(conf),
 		Scopes:                conf.Scopes,
 		TokenStore:            earlyRefreshTokenStore{NewFileTokenStore(tokenPath)},
 		PKCEEnabled:           !conf.PKCEDisabled,
@@ -98,22 +94,24 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 	default:
 		return errors.New("invalid client type")
 	}
+	// Decided before the client is built: a saved client that has to be
+	// replaced must not lend its credentials to the registration of the new
+	// one.
+	oauthConf.ignoreSavedClient, err = savedClientNeedsReplacing(serverName, oauthConf)
+	if err != nil {
+		return err
+	}
 	mcpClient, err := newRawClient(serverName, clientInfo)
 	if err != nil {
 		return fmt.Errorf("failed to create client: %w", err)
 	}
 	defer func() { _ = mcpClient.Close() }()
 
-	redirectURI := oauthConf.RedirectURI
-	if redirectURI == "" {
-		redirectURI = defaultOAuthRedirectURI
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	if err := mcpClient.Start(ctx); err != nil {
-		if authErr := authorizeInteractively(ctx, err, serverName, redirectURI); authErr != nil {
+		if authErr := authorizeInteractively(ctx, err, serverName, oauthConf); authErr != nil {
 			return authErr
 		}
 		if err := mcpClient.Start(ctx); err != nil {
@@ -125,7 +123,7 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initRequest.Params.ClientInfo = mcp.Implementation{Name: "mcp-proxy-authorize", Version: BuildVersion}
 	if _, err := mcpClient.Initialize(ctx, initRequest); err != nil {
-		if authErr := authorizeInteractively(ctx, err, serverName, redirectURI); authErr != nil {
+		if authErr := authorizeInteractively(ctx, err, serverName, oauthConf); authErr != nil {
 			return authErr
 		}
 		if _, err := mcpClient.Initialize(ctx, initRequest); err != nil {
@@ -140,12 +138,13 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 // authorizeInteractively runs the browser + local-callback OAuth dance if
 // err indicates authorization is required; otherwise it returns err (redacted,
 // since a transport error embeds the downstream URL) as-is.
-func authorizeInteractively(ctx context.Context, err error, serverName, redirectURI string) error {
+func authorizeInteractively(ctx context.Context, err error, serverName string, conf *OAuthClientConfig) error {
 	if !client.IsOAuthAuthorizationRequiredError(err) {
 		return redactURLCredentials(err)
 	}
 	oauthHandler := client.GetOAuthHandler(err)
 
+	redirectURI := oauthRedirectURI(conf)
 	callbackPath, addr, pErr := parseRedirectURI(redirectURI)
 	if pErr != nil {
 		return pErr
@@ -169,13 +168,9 @@ func authorizeInteractively(ctx context.Context, err error, serverName, redirect
 	}
 	defer func() { _ = srv.Close() }()
 
-	if oauthHandler.GetClientID() == "" {
-		if err := oauthHandler.RegisterClient(ctx, "mcp-proxy ("+serverName+")"); err != nil {
-			return fmt.Errorf("failed to register OAuth client: %w", err)
-		}
-		if err := saveRegisteredClient(serverName, oauthHandler.GetClientID(), oauthHandler.GetClientSecret()); err != nil {
-			return fmt.Errorf("failed to persist registered OAuth client: %w", err)
-		}
+	saveOnApproval, err := ensureRegisteredClient(ctx, oauthHandler, serverName, redirectURI, conf.ignoreSavedClient)
+	if err != nil {
+		return err
 	}
 
 	authURL, err := oauthHandler.GetAuthorizationURL(ctx, state, codeChallenge)
@@ -199,6 +194,14 @@ func authorizeInteractively(ctx context.Context, err error, serverName, redirect
 		if code == "" {
 			return errors.New("no authorization code received in callback")
 		}
+		// A client that replaces a saved one is saved only now that the
+		// provider has approved it: until then the saved client and its
+		// token stay as they were, for the daemon to keep using.
+		if saveOnApproval {
+			if err := saveRegisteredClient(serverName, oauthHandler.GetClientID(), oauthHandler.GetClientSecret(), redirectURI); err != nil {
+				return fmt.Errorf("failed to persist registered OAuth client: %w", err)
+			}
+		}
 		if err := oauthHandler.ProcessAuthorizationResponse(ctx, code, state, codeVerifier); err != nil {
 			return fmt.Errorf("failed to exchange authorization code: %w", err)
 		}
@@ -206,6 +209,56 @@ func authorizeInteractively(ctx context.Context, err error, serverName, redirect
 	case <-ctx.Done():
 		return fmt.Errorf("timed out waiting for authorization callback: %w", ctx.Err())
 	}
+}
+
+// oauthRedirectURI returns the redirect URI of an oauth block, or the default.
+func oauthRedirectURI(conf *OAuthClientConfig) string {
+	if conf.RedirectURI == "" {
+		return defaultOAuthRedirectURI
+	}
+	return conf.RedirectURI
+}
+
+// savedClientNeedsReplacing reports whether -authorize has to register a new
+// dynamic client instead of using the saved one. A client is registered for
+// one redirect URI: for any other the provider refuses the authorization
+// request, in the browser where -authorize cannot see it. So a saved client
+// is only used when it was registered for the configured redirect URI, which
+// rules out one saved before the redirect URI was recorded. A clientId from
+// the config is the operator's own registration and is never replaced.
+func savedClientNeedsReplacing(serverName string, conf *OAuthClientConfig) (bool, error) {
+	if conf.ClientID != "" {
+		return false, nil
+	}
+	saved, ok, err := readRegisteredClient(serverName)
+	if err != nil || !ok {
+		return false, err
+	}
+	return saved.RedirectURI != oauthRedirectURI(conf), nil
+}
+
+// ensureRegisteredClient registers a dynamic client when the handler has no
+// client ID. A first registration is saved at once. One that replaces a saved
+// client is not: saveOnApproval tells the caller to save it once the provider
+// has approved the sign-in.
+func ensureRegisteredClient(ctx context.Context, oauthHandler *transport.OAuthHandler, serverName, redirectURI string, replacing bool) (saveOnApproval bool, err error) {
+	if oauthHandler.GetClientID() != "" {
+		return false, nil
+	}
+	if replacing {
+		slog.Info("Registering a new OAuth client: the saved one was not registered for this redirect URI",
+			"server", serverName, "redirect_uri", redirectURI)
+	}
+	if err := oauthHandler.RegisterClient(ctx, "mcp-proxy ("+serverName+")"); err != nil {
+		return false, fmt.Errorf("failed to register OAuth client: %w", err)
+	}
+	if replacing {
+		return true, nil
+	}
+	if err := saveRegisteredClient(serverName, oauthHandler.GetClientID(), oauthHandler.GetClientSecret(), redirectURI); err != nil {
+		return false, fmt.Errorf("failed to persist registered OAuth client: %w", err)
+	}
+	return false, nil
 }
 
 // oauthAwareError rewrites an OAuthAuthorizationRequiredError into a message
