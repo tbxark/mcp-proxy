@@ -158,6 +158,9 @@ func writePrivateJSON(path string, value any) error {
 type registeredClient struct {
 	ClientID     string `json:"clientId"`
 	ClientSecret string `json:"clientSecret,omitempty"`
+	// RedirectURI is the redirect URI the client was registered with. Files
+	// written before it was recorded have none.
+	RedirectURI string `json:"redirectUri,omitempty"`
 }
 
 // oauthClientStorageSuffix separates a server's registered-client file from
@@ -176,35 +179,44 @@ func oauthClientPath(serverName string) (string, error) {
 // previously dynamically-registered client was persisted for this server,
 // or ("", "", false) if none exists yet.
 func loadRegisteredClient(serverName string) (string, string, bool, error) {
+	rc, ok, err := readRegisteredClient(serverName)
+	return rc.ClientID, rc.ClientSecret, ok, err
+}
+
+// readRegisteredClient returns the whole persisted registration, including
+// the redirect URI it was made with.
+func readRegisteredClient(serverName string) (registeredClient, bool, error) {
 	path, err := oauthClientPath(serverName)
 	if err != nil {
-		return "", "", false, err
+		return registeredClient{}, false, err
 	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return "", "", false, nil
+		return registeredClient{}, false, nil
 	}
 	if err != nil {
-		return "", "", false, fmt.Errorf("failed to read client file %s: %w", path, err)
+		return registeredClient{}, false, fmt.Errorf("failed to read client file %s: %w", path, err)
 	}
 	return parseRegisteredClient(path, data)
 }
 
-func parseRegisteredClient(path string, data []byte) (string, string, bool, error) {
+func parseRegisteredClient(path string, data []byte) (registeredClient, bool, error) {
 	var rc registeredClient
 	if err := json.Unmarshal(data, &rc); err != nil {
-		return "", "", false, fmt.Errorf("failed to parse client file %s: %w", path, err)
+		return registeredClient{}, false, fmt.Errorf("failed to parse client file %s: %w", path, err)
 	}
 	if rc.ClientID == "" {
-		return "", "", false, fmt.Errorf("client file %s does not contain a clientId", path)
+		return registeredClient{}, false, fmt.Errorf("client file %s does not contain a clientId", path)
 	}
-	return rc.ClientID, rc.ClientSecret, true, nil
+	return rc, true, nil
 }
 
 // saveRegisteredClient persists a dynamically-registered client's
 // credentials so future daemon starts (and re-authorizations) reuse the
-// same registration instead of getting an empty ClientID.
-func saveRegisteredClient(serverName, clientID, clientSecret string) error {
+// same registration instead of getting an empty ClientID. redirectURI is the
+// one it was registered with, so a later -authorize can tell when the config
+// has moved on from it.
+func saveRegisteredClient(serverName, clientID, clientSecret, redirectURI string) error {
 	path, err := oauthClientPath(serverName)
 	if err != nil {
 		return err
@@ -212,7 +224,7 @@ func saveRegisteredClient(serverName, clientID, clientSecret string) error {
 	if clientID == "" {
 		return errors.New("cannot save an empty OAuth clientId")
 	}
-	return writePrivateJSON(path, registeredClient{ClientID: clientID, ClientSecret: clientSecret})
+	return writePrivateJSON(path, registeredClient{ClientID: clientID, ClientSecret: clientSecret, RedirectURI: redirectURI})
 }
 
 // tokenRefreshLeeway is how long before its recorded expiry an access token is

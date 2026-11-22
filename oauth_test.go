@@ -2,14 +2,20 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mark3labs/mcp-go/client/transport"
 )
 
 func TestParseRedirectURI(t *testing.T) {
@@ -156,6 +162,115 @@ func TestOAuthCallbackServerFailsWhenAddressInUse(t *testing.T) {
 	}
 }
 
+// -authorize reuses a saved dynamically registered client only when it was
+// registered for the configured redirect URI. Otherwise it registers a new
+// one, from clean credentials, and leaves the saved one in place until the
+// provider has approved the sign-in.
+func TestAuthorizeReplacesStaleRegisteredClient(t *testing.T) {
+	isolateUserConfigDir(t)
+	const serverName = "remote"
+	const first = "http://localhost:8090/oauth/callback"
+	const second = "http://localhost:8090/callback"
+
+	type registration struct {
+		RedirectURIs []string `json:"redirect_uris"`
+		AuthMethod   string   `json:"token_endpoint_auth_method"`
+	}
+	var registrations atomic.Int32
+	var lastRegistration atomic.Pointer[registration]
+	mux := http.NewServeMux()
+	authServer := httptest.NewServer(mux)
+	t.Cleanup(authServer.Close)
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":                 authServer.URL,
+			"authorization_endpoint": authServer.URL + "/authorize",
+			"token_endpoint":         authServer.URL + "/token",
+			"registration_endpoint":  authServer.URL + "/register",
+		})
+	})
+	mux.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
+		var request registration
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		lastRegistration.Store(&request)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = fmt.Fprintf(w, `{"client_id":"client-%d","client_secret":"secret"}`, registrations.Add(1))
+	})
+
+	// authorize does what -authorize does before it opens the browser. It
+	// returns the client ID the handler ends with and whether that client
+	// still has to be saved.
+	authorize := func(conf OAuthClientConfig) (string, bool) {
+		t.Helper()
+		conf.AuthServerMetadataURL = authServer.URL + "/.well-known/oauth-authorization-server"
+		replacing, err := savedClientNeedsReplacing(serverName, &conf)
+		if err != nil {
+			t.Fatalf("saved client needs replacing: %v", err)
+		}
+		conf.ignoreSavedClient = replacing
+		oauthConfig, err := buildOAuthConfig(serverName, &conf)
+		if err != nil {
+			t.Fatalf("build OAuth config: %v", err)
+		}
+		handler := transport.NewOAuthHandler(oauthConfig)
+		saveOnApproval, err := ensureRegisteredClient(context.Background(), handler, serverName, oauthConfig.RedirectURI, replacing)
+		if err != nil {
+			t.Fatalf("ensure registered client: %v", err)
+		}
+		return handler.GetClientID(), saveOnApproval
+	}
+	savedClient := func() registeredClient {
+		t.Helper()
+		saved, ok, err := readRegisteredClient(serverName)
+		if err != nil || !ok {
+			t.Fatalf("read saved client: ok=%v err=%v", ok, err)
+		}
+		return saved
+	}
+
+	if got, pending := authorize(OAuthClientConfig{RedirectURI: first}); got != "client-1" || pending {
+		t.Fatalf("first run: client = %q pending = %v, want client-1 saved at once", got, pending)
+	}
+	if got, _ := authorize(OAuthClientConfig{RedirectURI: first}); got != "client-1" {
+		t.Fatalf("same redirect URI: client = %q, want the saved client-1", got)
+	}
+
+	// A changed redirect URI gets a new client. It is registered like a first
+	// one, without the old client's secret, and the saved client stays until
+	// the sign-in is approved, so an abandoned sign-in changes nothing.
+	if got, pending := authorize(OAuthClientConfig{RedirectURI: second}); got != "client-2" || !pending {
+		t.Fatalf("changed redirect URI: client = %q pending = %v, want a new client-2 not yet saved", got, pending)
+	}
+	if request := lastRegistration.Load(); len(request.RedirectURIs) != 1 || request.RedirectURIs[0] != second || request.AuthMethod != "none" {
+		t.Fatalf("replacement registration = %+v, want redirect URI %q and auth method none", *request, second)
+	}
+	if saved := savedClient(); saved.ClientID != "client-1" || saved.RedirectURI != first {
+		t.Fatalf("saved client before approval = %+v, want client-1 registered with %q", saved, first)
+	}
+
+	// A clientId in the config is used as it is, even when it equals a saved
+	// client that was registered with another redirect URI.
+	if got, pending := authorize(OAuthClientConfig{ClientID: "client-1", RedirectURI: second}); got != "client-1" || pending {
+		t.Fatalf("configured clientId: client = %q pending = %v, want client-1 kept", got, pending)
+	}
+
+	// A client saved before the redirect URI was recorded is replaced too.
+	path, err := oauthClientPath(serverName)
+	if err != nil {
+		t.Fatalf("client path: %v", err)
+	}
+	writeFile(t, path, `{"clientId":"legacy"}`)
+	if got, pending := authorize(OAuthClientConfig{RedirectURI: first}); got != "client-3" || !pending {
+		t.Fatalf("client file without redirect URI: client = %q pending = %v, want a new client-3 not yet saved", got, pending)
+	}
+	if got := registrations.Load(); got != 3 {
+		t.Fatalf("registrations = %d, want 3", got)
+	}
+}
+
 func closeResponse(t *testing.T, response *http.Response) {
 	t.Helper()
 	_, _ = io.Copy(io.Discard, response.Body)
@@ -170,7 +285,7 @@ func TestAuthorizeInteractivelyRedactsNonAuthError(t *testing.T) {
 	t.Parallel()
 
 	urlErr := &url.Error{Op: "Post", URL: "https://mcp.example.com/mcp?key=AUTH_SECRET", Err: errors.New("refused")}
-	got := authorizeInteractively(context.Background(), urlErr, "server", "http://localhost:8090/oauth/callback")
+	got := authorizeInteractively(context.Background(), urlErr, "server", &OAuthClientConfig{})
 	if got == nil {
 		t.Fatal("expected the non-auth error to be returned")
 	}

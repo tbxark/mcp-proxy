@@ -172,6 +172,13 @@ new OAuth handler with an empty client ID and every token refresh would
 silently be rejected by the provider once the access token expires -
 looking, from the logs, like a refresh failure with no obvious cause.
 
+The client is registered for one `redirectUri`, which is saved with it. The
+provider refuses a sign-in that uses the client with any other, and it does so
+in the browser, where `-authorize` only sees a timeout. So when `redirectUri`
+has changed, or the client was saved by a version that did not record it yet,
+`-authorize` signs in with a newly registered client, and saves it in place of
+the old one once the sign-in is approved.
+
 ## options
 
 - `panicIfInvalid` (bool): If true, startup fails when a client cannot initialize.

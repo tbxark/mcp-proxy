@@ -199,7 +199,7 @@ func TestOAuthTokenAndClientPathsDoNotAlias(t *testing.T) {
 
 	// Round trip: each schema is written and read back intact, so neither write
 	// clobbered the other's file.
-	if err := saveRegisteredClient(serverName, "cid-1", "sec-1"); err != nil {
+	if err := saveRegisteredClient(serverName, "cid-1", "sec-1", "http://localhost:8090/oauth/callback"); err != nil {
 		t.Fatalf("saveRegisteredClient: %v", err)
 	}
 	if err := NewFileTokenStore(tokenPath).SaveToken(context.Background(), &transport.Token{AccessToken: "tok", RefreshToken: "r"}); err != nil {

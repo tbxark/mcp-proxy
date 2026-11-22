@@ -92,6 +92,11 @@ type OAuthClientConfig struct {
 	// some providers (e.g. Datadog) only serve it at the RFC 8414
 	// location.
 	AuthServerMetadataURL string `json:"authServerMetadataUrl,omitempty"`
+
+	// ignoreSavedClient makes buildOAuthConfig leave out the dynamically
+	// registered client saved on disk. -authorize sets it when that client
+	// has to be replaced. It is not part of the config schema.
+	ignoreSavedClient bool
 }
 
 const defaultOAuthRedirectURI = "http://localhost:8090/oauth/callback"
