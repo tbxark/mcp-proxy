@@ -139,3 +139,25 @@ running when you authorized, restart it now - the new token won't be
 picked up otherwise. After that, tokens refresh automatically as they
 expire with no further restarts needed. Re-run `-authorize` only if the
 server reports the token is no longer valid (e.g. access was revoked).
+
+### Authorizing on a machine without a browser
+
+By default the provider redirects the browser to `http://localhost:8090/oauth/callback`,
+so the browser has to run on the same machine as `-authorize`. On a headless
+server, either forward that port over SSH (`ssh -L 8090:localhost:8090 <server>`)
+and open the logged URL locally, or let a reverse proxy on the server receive
+the callback:
+
+```jsonc
+"oauth": {
+  "redirectUri": "https://gateway.example.net/oauth/callback",
+  "callbackListen": "127.0.0.1:8090"
+}
+```
+
+`redirectUri` is what the provider sends the browser to. The reverse proxy
+(nginx, Caddy, ...) serves it and forwards `/oauth/callback`, with the path
+unchanged, to `callbackListen`, where the listener only exists while
+`-authorize` runs. Run `-authorize` on the server, open the URL it logs in a
+browser on any device that can reach `redirectUri`, and approve. With a static
+`clientId`, register the same `redirectUri` with the provider.

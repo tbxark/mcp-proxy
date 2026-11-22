@@ -62,7 +62,9 @@ func buildOAuthConfig(serverName string, conf *OAuthClientConfig) (transport.OAu
 // a browser to the provider's consent screen, waits for the local redirect
 // callback, exchanges the code for a token, and persists it via the same
 // FileTokenStore the daemon reads from. Intended to be run by hand, in a
-// real desktop session with a browser - never by the unattended daemon.
+// real desktop session with a browser - never by the unattended daemon. On
+// a machine without a browser the URL it logs can be opened on another
+// device, provided the callback reaches this process (oauth.callbackListen).
 func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpHeaders string, httpTimeout int) error {
 	config, err := load(configPath, insecure, expandEnv, httpHeaders, httpTimeout)
 	if err != nil {
@@ -145,9 +147,14 @@ func authorizeInteractively(ctx context.Context, err error, serverName string, c
 	oauthHandler := client.GetOAuthHandler(err)
 
 	redirectURI := oauthRedirectURI(conf)
-	callbackPath, addr, pErr := parseRedirectURI(redirectURI)
+	callbackPath, addr, pErr := parseRedirectURI(redirectURI, conf.CallbackListen != "")
 	if pErr != nil {
 		return pErr
+	}
+	if conf.CallbackListen != "" {
+		if addr, pErr = parseCallbackListen(conf.CallbackListen); pErr != nil {
+			return pErr
+		}
 	}
 
 	codeVerifier, err := client.GenerateCodeVerifier()
@@ -181,7 +188,7 @@ func authorizeInteractively(ctx context.Context, err error, serverName string, c
 	slog.Info("Opening browser for authorization", "server", serverName, "url", authURL)
 	openBrowser(authURL)
 
-	slog.Info("Waiting for authorization callback", "server", serverName, "redirect_uri", redirectURI)
+	slog.Info("Waiting for authorization callback", "server", serverName, "redirect_uri", redirectURI, "listen", srv.Addr)
 	select {
 	case params := <-callbackChan:
 		if errMsg := params["error"]; errMsg != "" {
@@ -271,7 +278,13 @@ func oauthAwareError(serverName string, err error) error {
 	return err
 }
 
-func parseRedirectURI(redirectURI string) (path string, addr string, err error) {
+// parseRedirectURI returns the callback path of the redirect URI and its
+// host:port. By default the callback listener binds to that host:port, so the
+// URI has to be an http loopback URL with an explicit port. With behindProxy
+// (oauth.callbackListen is set) the listener binds elsewhere and the URI is
+// only where the provider sends the browser: https on any host is allowed as
+// well, and the port is optional.
+func parseRedirectURI(redirectURI string, behindProxy bool) (path string, addr string, err error) {
 	// Echo a redacted form: this error is printed and logged, and the URI could
 	// carry a credential in its userinfo or query. A URL that does not parse is
 	// replaced entirely, since its raw text cannot be redacted reliably.
@@ -280,8 +293,12 @@ func parseRedirectURI(redirectURI string) (path string, addr string, err error) 
 	if err != nil {
 		return "", "", fmt.Errorf("invalid redirect URI %q", display)
 	}
-	if u.Scheme != "http" {
-		return "", "", fmt.Errorf("redirect URI %q must use http", display)
+	schemes := "http"
+	if behindProxy {
+		schemes = "http or https"
+	}
+	if u.Scheme != "http" && (u.Scheme != "https" || !behindProxy) {
+		return "", "", fmt.Errorf("redirect URI %q must use %s", display, schemes)
 	}
 	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return "", "", fmt.Errorf("redirect URI %q cannot contain user info, query, or fragment", display)
@@ -291,21 +308,46 @@ func parseRedirectURI(redirectURI string) (path string, addr string, err error) 
 		return "", "", fmt.Errorf("redirect URI %q must include a host", display)
 	}
 	ip := net.ParseIP(hostname)
-	if !strings.EqualFold(hostname, "localhost") && (ip == nil || !ip.IsLoopback()) {
+	if u.Scheme == "http" && !strings.EqualFold(hostname, "localhost") && (ip == nil || !ip.IsLoopback()) {
+		if behindProxy {
+			// The authorization code travels to this URL, so off loopback
+			// it has to be encrypted.
+			return "", "", fmt.Errorf("redirect URI %q must use https unless its host is localhost or a loopback IP", display)
+		}
 		return "", "", fmt.Errorf("redirect URI %q must use localhost or a loopback IP", display)
 	}
 	port := u.Port()
-	if port == "" {
+	if port == "" && !behindProxy {
 		return "", "", fmt.Errorf("redirect URI %q must include an explicit port", display)
 	}
-	portNumber, err := strconv.Atoi(port)
-	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return "", "", fmt.Errorf("redirect URI %q contains an invalid port", display)
+	if port != "" {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return "", "", fmt.Errorf("redirect URI %q contains an invalid port", display)
+		}
 	}
 	if u.Path == "" || u.Path == "/" {
 		return "", "", fmt.Errorf("redirect URI %q must include a callback path", display)
 	}
 	return u.Path, net.JoinHostPort(hostname, port), nil
+}
+
+// parseCallbackListen validates oauth.callbackListen and returns the address
+// the callback listener binds to. Like the default address it has to be
+// loopback: the listener never binds to a public interface.
+func parseCallbackListen(callbackListen string) (addr string, err error) {
+	host, port, err := net.SplitHostPort(callbackListen)
+	if err != nil {
+		return "", errors.New("callback listen address must be host:port")
+	}
+	if !isLoopbackHostname(host) {
+		return "", errors.New("callback listen address must use localhost or a loopback IP")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", errors.New("callback listen address contains an invalid port")
+	}
+	return net.JoinHostPort(host, strconv.Itoa(portNumber)), nil
 }
 
 func startOAuthCallbackServer(addr, callbackPath, expectedState string, callbackChan chan<- map[string]string) (*http.Server, error) {

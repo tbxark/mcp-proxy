@@ -96,6 +96,18 @@ func TestValidateConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("public OAuth redirect with callbackListen", func(t *testing.T) {
+		config := validTestConfig()
+		config.McpServers["remote"] = &MCPClientConfigV2{
+			URL:     "https://example.com/mcp",
+			OAuth:   &OAuthClientConfig{RedirectURI: "https://gateway.example.net/oauth/callback", CallbackListen: "127.0.0.1:8090"},
+			Options: &OptionsV2{},
+		}
+		if err := validateConfig(config); err != nil {
+			t.Fatalf("validate config: %v", err)
+		}
+	})
+
 	tests := []struct {
 		name    string
 		mutate  func(*Config)
@@ -123,6 +135,27 @@ func TestValidateConfig(t *testing.T) {
 				Options: &OptionsV2{},
 			}
 		}, wantErr: "loopback"},
+		{name: "public OAuth redirect without callbackListen", mutate: func(c *Config) {
+			c.McpServers["stdio"] = &MCPClientConfigV2{
+				URL:     "https://example.com/mcp",
+				OAuth:   &OAuthClientConfig{RedirectURI: "https://gateway.example.net/oauth/callback"},
+				Options: &OptionsV2{},
+			}
+		}, wantErr: `.oauth.redirectUri: redirect URI "https://gateway.example.net/oauth/callback" must use http`},
+		{name: "callbackListen without redirectUri", mutate: func(c *Config) {
+			c.McpServers["stdio"] = &MCPClientConfigV2{
+				URL:     "https://example.com/mcp",
+				OAuth:   &OAuthClientConfig{CallbackListen: "127.0.0.1:8090"},
+				Options: &OptionsV2{},
+			}
+		}, wantErr: "callbackListen requires redirectUri"},
+		{name: "public callbackListen", mutate: func(c *Config) {
+			c.McpServers["stdio"] = &MCPClientConfigV2{
+				URL:     "https://example.com/mcp",
+				OAuth:   &OAuthClientConfig{RedirectURI: "https://gateway.example.net/oauth/callback", CallbackListen: "0.0.0.0:8090"},
+				Options: &OptionsV2{},
+			}
+		}, wantErr: ".oauth.callbackListen: callback listen address must use localhost or a loopback IP"},
 		{name: "secret without client ID", mutate: func(c *Config) {
 			c.McpServers["stdio"] = &MCPClientConfigV2{
 				URL:     "https://example.com/mcp",
