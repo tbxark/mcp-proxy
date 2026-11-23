@@ -201,16 +201,17 @@ func authorizeInteractively(ctx context.Context, err error, serverName string, c
 		if code == "" {
 			return errors.New("no authorization code received in callback")
 		}
-		// A client that replaces a saved one is saved only now that the
-		// provider has approved it: until then the saved client and its
-		// token stay as they were, for the daemon to keep using.
+		if err := oauthHandler.ProcessAuthorizationResponse(ctx, code, state, codeVerifier); err != nil {
+			return fmt.Errorf("failed to exchange authorization code: %w", err)
+		}
+		// A client that replaces a saved one is saved only once its token
+		// has been issued: until then the saved client and its token stay
+		// as they were, for the daemon to keep using, and a failed exchange
+		// cannot leave the old token paired with the new client.
 		if saveOnApproval {
 			if err := saveRegisteredClient(serverName, oauthHandler.GetClientID(), oauthHandler.GetClientSecret(), redirectURI); err != nil {
 				return fmt.Errorf("failed to persist registered OAuth client: %w", err)
 			}
-		}
-		if err := oauthHandler.ProcessAuthorizationResponse(ctx, code, state, codeVerifier); err != nil {
-			return fmt.Errorf("failed to exchange authorization code: %w", err)
 		}
 		return nil
 	case <-ctx.Done():
@@ -246,8 +247,8 @@ func savedClientNeedsReplacing(serverName string, conf *OAuthClientConfig) (bool
 
 // ensureRegisteredClient registers a dynamic client when the handler has no
 // client ID. A first registration is saved at once. One that replaces a saved
-// client is not: saveOnApproval tells the caller to save it once the provider
-// has approved the sign-in.
+// client is not: saveOnApproval tells the caller to save it once the sign-in
+// has been approved and its token issued.
 func ensureRegisteredClient(ctx context.Context, oauthHandler *transport.OAuthHandler, serverName, redirectURI string, replacing bool) (saveOnApproval bool, err error) {
 	if oauthHandler.GetClientID() != "" {
 		return false, nil
